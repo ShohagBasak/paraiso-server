@@ -8,10 +8,24 @@ const jwt = require('jsonwebtoken');
 
 const app = express();
 
+const allowedOrigins = [
+  'http://localhost:5173',
+  process.env.FRONTEND_URL
+].filter(Boolean).map(url => url.replace(/\/$/, ''));
+
 app.use(cors({ 
-  origin: ['http://localhost:5173', process.env.FRONTEND_URL].filter(Boolean), 
+  origin: allowedOrigins, 
   credentials: true 
 }));
+
+const isProduction = process.env.NODE_ENV === 'production' || (process.env.FRONTEND_URL && !process.env.FRONTEND_URL.includes('localhost'));
+const cookieOptions = {
+  httpOnly: true,
+  secure: isProduction,
+  sameSite: isProduction ? 'none' : 'lax',
+  maxAge: 7 * 24 * 60 * 60 * 1000
+};
+
 app.use(express.json());
 app.use(cookieParser());
 
@@ -58,7 +72,7 @@ app.post('/register', async (req, res) => {
   db.query(sql, [username, email, hashedPassword], (err, result) => {
     if (err) return res.status(500).json({ message: "Registration failed. Email may already exist." });
     const token = jwt.sign({ id: result.insertId, email, role: 'user' }, process.env.JWT_SECRET, { expiresIn: '7d' });
-    res.cookie('token', token, { httpOnly: true, secure: false, sameSite: 'lax', maxAge: 7 * 24 * 60 * 60 * 1000 });
+    res.cookie('token', token, cookieOptions);
     res.status(201).json({ user: { id: result.insertId, username, email, role: 'user' } });
   });
 });
@@ -73,7 +87,7 @@ app.post('/login', (req, res) => {
     if (!match) return res.status(401).json({ message: "Invalid password" });
     const { id, username, role } = results[0];
     const token = jwt.sign({ id, email, role }, process.env.JWT_SECRET, { expiresIn: '7d' });
-    res.cookie('token', token, { httpOnly: true, secure: false, sameSite: 'lax', maxAge: 7 * 24 * 60 * 60 * 1000 });
+    res.cookie('token', token, cookieOptions);
     res.json({ user: { id, username, email, role } });
   });
 });
@@ -94,7 +108,11 @@ app.post('/reset-password', async (req, res) => {
 
 // ─── POST /logout ─────────────────────────────────────────
 app.post('/logout', (req, res) => {
-  res.clearCookie('token');
+  res.clearCookie('token', {
+    httpOnly: true,
+    secure: cookieOptions.secure,
+    sameSite: cookieOptions.sameSite
+  });
   res.json({ message: 'Logged out successfully' });
 });
 
