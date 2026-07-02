@@ -81,7 +81,7 @@ CREATE TABLE IF NOT EXISTS roster_members (
   section_order INT DEFAULT 0,            -- controls section display order
   title VARCHAR(255) NOT NULL,            -- e.g. 'PRESIDENT', 'CHIEF OF POLICE'
   name VARCHAR(255) DEFAULT 'Vacant',     -- member name or 'Vacant'
-  description TEXT DEFAULT '',            -- role description
+  description TEXT,                       -- role description
   sort_order INT DEFAULT 0,               -- within-section order
   color VARCHAR(50) DEFAULT NULL,         -- custom role/text color hex or name
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP

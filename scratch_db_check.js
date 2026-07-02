@@ -1,22 +1,19 @@
 const db = require('./db');
 
-console.log("Checking roster_sections table details...");
-
-db.query("DESCRIBE roster_sections", (err, cols) => {
+db.query("SELECT COUNT(*) as count FROM roster_sections", (err, res1) => {
   if (err) {
-    console.error("Error describing table:", err);
-    process.exit(1);
+    console.error("Error checking roster_sections:", err.message);
+  } else {
+    console.log("roster_sections count:", res1[0].count);
   }
-  console.log("Columns in roster_sections:");
-  console.table(cols);
 
-  db.query("SELECT * FROM roster_sections", (err2, rows) => {
+  db.query("SELECT COUNT(*) as count FROM roster_members", (err2, res2) => {
     if (err2) {
-      console.error("Error selecting rows:", err2);
-      process.exit(1);
+      console.error("Error checking roster_members:", err2.message);
+    } else {
+      console.log("roster_members count:", res2[0].count);
     }
-    console.log("Rows in roster_sections:");
-    console.table(rows);
     process.exit(0);
   });
 });
+
