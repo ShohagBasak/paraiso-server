@@ -2,9 +2,16 @@
 -- PARAISO GAMING PORTAL - MYSQL DATABASE SCHEMA
 -- ====================================================================
 
--- 1. ALTER USERS TABLE
--- Adds role-based permissions (default is 'user', admins are manually promoted)
-ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(50) DEFAULT 'user';
+-- 1. USERS TABLE
+-- Stores user accounts and administrative roles
+CREATE TABLE IF NOT EXISTS users (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  username VARCHAR(100) NOT NULL,
+  email VARCHAR(150) NOT NULL UNIQUE,
+  password_hash VARCHAR(255) NOT NULL,
+  role VARCHAR(50) DEFAULT 'user',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 
 
 -- 2. BANNER SLIDES TABLE
@@ -62,5 +69,32 @@ CREATE TABLE IF NOT EXISTS staff_roles (
   color VARCHAR(50) DEFAULT '#ffffff',
   icon_name VARCHAR(100) DEFAULT 'FaUserShield',
   sort_order INT DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+
+-- 6. GOVERNMENT ROSTER TABLE
+-- Stores faction/government roster members with section grouping
+CREATE TABLE IF NOT EXISTS roster_members (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  section VARCHAR(100) NOT NULL,          -- e.g. 'FEDERAL GOVERNMENT', 'LAW ENFORCEMENT & EMERGENCY SERVICES', 'AGENCIES'
+  section_order INT DEFAULT 0,            -- controls section display order
+  title VARCHAR(255) NOT NULL,            -- e.g. 'PRESIDENT', 'CHIEF OF POLICE'
+  name VARCHAR(255) DEFAULT 'Vacant',     -- member name or 'Vacant'
+  description TEXT DEFAULT '',            -- role description
+  sort_order INT DEFAULT 0,               -- within-section order
+  color VARCHAR(50) DEFAULT NULL,         -- custom role/text color hex or name
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+
+-- 7. ROSTER SECTIONS / FACTIONS TABLE
+-- Stores explicit sections/factions for the Government Roster
+CREATE TABLE IF NOT EXISTS roster_sections (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(100) NOT NULL UNIQUE,
+  sort_order INT DEFAULT 0,
+  color VARCHAR(50) DEFAULT NULL,
+  icon VARCHAR(50) DEFAULT NULL,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

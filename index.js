@@ -545,6 +545,399 @@ app.put('/staff-roles/reorder', verifyAdmin, (req, res) => {
 });
 
 
+// ─── GOVERNMENT ROSTER ────────────────────────────────────
+
+// Auto-add color column to roster_members table if missing
+db.query("SHOW COLUMNS FROM roster_members LIKE 'color'", (err, results) => {
+  if (!err && (!results || results.length === 0)) {
+    db.query("ALTER TABLE roster_members ADD COLUMN color VARCHAR(50) DEFAULT NULL", (err2) => {
+      if (err2) console.error("Error adding color column to roster_members:", err2);
+      else console.log("Added color column to roster_members table.");
+    });
+  }
+});
+
+// GET /roster — public, returns all members grouped by section
+app.get('/roster', (req, res) => {
+  const sql = `
+    SELECT m.*, s.color AS section_color, s.icon AS section_icon 
+    FROM roster_members m 
+    LEFT JOIN roster_sections s ON m.section = s.name 
+    ORDER BY m.section_order ASC, m.sort_order ASC
+  `;
+  db.query(sql, (err, results) => {
+    if (err) return res.status(500).json({ message: 'DB error', error: err });
+    res.json(results);
+  });
+});
+
+// POST /roster — admin only, add new member
+app.post('/roster', verifyAdmin, (req, res) => {
+  const { section, title, name, description, section_order, sort_order, color } = req.body;
+  if (!section || !title) return res.status(400).json({ message: 'section and title are required' });
+  const sql = "INSERT INTO roster_members (section, title, name, description, section_order, sort_order, color) VALUES (?, ?, ?, ?, ?, ?, ?)";
+  db.query(sql, [section, title, name || 'Vacant', description || '', section_order || 0, sort_order || 0, color || null], (err, result) => {
+    if (err) return res.status(500).json({ message: 'Failed to add roster member', error: err });
+    res.json({ message: 'Member added', id: result.insertId });
+  });
+});
+
+// PUT /roster/:id — admin only, update a member
+app.put('/roster/:id', verifyAdmin, (req, res) => {
+  const { section, title, name, description, section_order, sort_order, color } = req.body;
+  const sql = "UPDATE roster_members SET section=?, title=?, name=?, description=?, section_order=?, sort_order=?, color=? WHERE id=?";
+  db.query(sql, [section, title, name || 'Vacant', description || '', section_order || 0, sort_order || 0, color || null, req.params.id], (err) => {
+    if (err) return res.status(500).json({ message: 'Failed to update member', error: err });
+    res.json({ message: 'Member updated' });
+  });
+});
+
+// DELETE /roster/:id — admin only
+app.delete('/roster/:id', verifyAdmin, (req, res) => {
+  db.query("DELETE FROM roster_members WHERE id = ?", [req.params.id], (err) => {
+    if (err) return res.status(500).json({ message: 'Failed to delete member', error: err });
+    res.json({ message: 'Member deleted' });
+  });
+});
+
+// PUT /roster/reorder — admin only, bulk update sort_order
+app.put('/roster/reorder', verifyAdmin, (req, res) => {
+  const { orders } = req.body;
+  if (!Array.isArray(orders) || orders.length === 0)
+    return res.json({ message: 'Nothing to reorder' });
+
+  let completed = 0;
+  let hasError = false;
+  orders.forEach(item => {
+    db.query("UPDATE roster_members SET sort_order = ? WHERE id = ?", [item.sort_order, item.id], (err) => {
+      if (err && !hasError) {
+        hasError = true;
+        return res.status(500).json({ message: 'Reorder failed', error: err });
+      }
+      completed++;
+      if (completed === orders.length && !hasError) {
+        res.json({ message: 'Roster order updated' });
+      }
+    });
+  });
+});
+
+
+// GET /roster/sections — public (with auto-migration/seeding if empty)
+app.get('/roster/sections', (req, res) => {
+  const createTableSql = `
+    CREATE TABLE IF NOT EXISTS roster_sections (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      name VARCHAR(100) NOT NULL UNIQUE,
+      sort_order INT DEFAULT 0,
+      color VARCHAR(50) DEFAULT NULL,
+      icon VARCHAR(50) DEFAULT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+  `;
+  
+  db.query(createTableSql, (tableErr) => {
+    if (tableErr) return res.status(500).json({ message: 'Failed to ensure roster_sections table', error: tableErr });
+
+    // Double check color column exists (for upgrade compatibility)
+    db.query("SHOW COLUMNS FROM roster_sections LIKE 'color'", (errCol, cols) => {
+      if (!errCol && (!cols || cols.length === 0)) {
+        db.query("ALTER TABLE roster_sections ADD COLUMN color VARCHAR(50) DEFAULT NULL");
+      }
+    });
+
+    // Double check icon column exists
+    db.query("SHOW COLUMNS FROM roster_sections LIKE 'icon'", (errIcon, cols) => {
+      if (!errIcon && (!cols || cols.length === 0)) {
+        db.query("ALTER TABLE roster_sections ADD COLUMN icon VARCHAR(50) DEFAULT NULL");
+      }
+    });
+
+    db.query("SELECT * FROM roster_sections ORDER BY sort_order ASC", (err, results) => {
+      if (err) return res.status(500).json({ message: 'DB error', error: err });
+      
+      if (results && results.length > 0) {
+        return res.json(results);
+      }
+
+      // Table is empty, auto-migrate sections from existing roster_members or seed default preset groups
+      db.query("SELECT DISTINCT section FROM roster_members WHERE section IS NOT NULL AND section != ''", (err2, memberSecs) => {
+        if (err2) return res.status(500).json({ message: 'Failed to fetch members', error: err2 });
+
+        let uniqueNames = memberSecs.map(r => r.section);
+        if (uniqueNames.length === 0) {
+          // Seed default preset groups if database is fully empty
+          uniqueNames = ['FEDERAL GOVERNMENT', 'LAW ENFORCEMENT & EMERGENCY SERVICES', 'AGENCIES'];
+        }
+
+        let completed = 0;
+        uniqueNames.forEach((name, idx) => {
+          let defaultColor = null;
+          let defaultIcon = null;
+          if (name === 'FEDERAL GOVERNMENT') { defaultColor = '#ef4444'; defaultIcon = '🏛️'; }
+          else if (name === 'LAW ENFORCEMENT & EMERGENCY SERVICES') { defaultColor = '#3b82f6'; defaultIcon = '🛡️'; }
+          else if (name === 'AGENCIES') { defaultColor = '#a855f7'; defaultIcon = '📡'; }
+
+          db.query("INSERT IGNORE INTO roster_sections (name, sort_order, color, icon) VALUES (?, ?, ?, ?)", [name, idx + 1, defaultColor, defaultIcon], (err3) => {
+            completed++;
+            if (completed === uniqueNames.length) {
+              // Retrieve newly inserted sections and return
+              db.query("SELECT * FROM roster_sections ORDER BY sort_order ASC", (err4, finalResults) => {
+                if (err4) return res.status(500).json({ message: 'DB error', error: err4 });
+                res.json(finalResults);
+              });
+            }
+          });
+        });
+      });
+    });
+  });
+});
+
+// POST /roster/sections — admin only
+app.post('/roster/sections', verifyAdmin, (req, res) => {
+  const { name, sort_order, color, icon } = req.body;
+  if (!name) return res.status(400).json({ message: 'Section name is required' });
+  const sql = "INSERT INTO roster_sections (name, sort_order, color, icon) VALUES (?, ?, ?, ?)";
+  db.query(sql, [name, sort_order || 0, color || null, icon || null], (err, result) => {
+    if (err) {
+      if (err.code === 'ER_DUP_ENTRY') {
+        return res.status(400).json({ message: 'Section name already exists' });
+      }
+      return res.status(500).json({ message: 'Failed to create section', error: err });
+    }
+    res.json({ message: 'Section created', id: result.insertId });
+  });
+});
+
+// PUT /roster/sections/:id — admin only
+app.put('/roster/sections/:id', verifyAdmin, (req, res) => {
+  const { name, sort_order, color, icon } = req.body;
+  if (!name) return res.status(400).json({ message: 'Section name is required' });
+
+  db.query("SELECT name FROM roster_sections WHERE id = ?", [req.params.id], (err, results) => {
+    if (err || results.length === 0) return res.status(404).json({ message: 'Section not found' });
+    const oldName = results[0].name;
+
+    db.query("UPDATE roster_sections SET name = ?, sort_order = ?, color = ?, icon = ? WHERE id = ?", [name, sort_order || 0, color || null, icon || null, req.params.id], (err2) => {
+      if (err2) return res.status(500).json({ message: 'Failed to update section', error: err2 });
+
+      // Cascade name & order updates to existing members
+      db.query("UPDATE roster_members SET section = ?, section_order = ? WHERE section = ?", [name, sort_order || 0, oldName], (err3) => {
+        res.json({ message: 'Section updated successfully' });
+      });
+    });
+  });
+});
+
+// DELETE /roster/sections/:id — admin only
+app.delete('/roster/sections/:id', verifyAdmin, (req, res) => {
+  db.query("SELECT name FROM roster_sections WHERE id = ?", [req.params.id], (err, results) => {
+    if (err || results.length === 0) return res.status(404).json({ message: 'Section not found' });
+    const sectionName = results[0].name;
+
+    db.query("DELETE FROM roster_sections WHERE id = ?", [req.params.id], (err2) => {
+      if (err2) return res.status(500).json({ message: 'Failed to delete section', error: err2 });
+
+      // Delete all roster members assigned to this section
+      db.query("DELETE FROM roster_members WHERE section = ?", [sectionName], (err3) => {
+        res.json({ message: 'Section and its members deleted' });
+      });
+    });
+  });
+});
+
+// PUT /roster/sections/reorder — admin only
+app.put('/roster/sections/reorder', verifyAdmin, (req, res) => {
+  const { orders } = req.body;
+  if (!Array.isArray(orders) || orders.length === 0)
+    return res.json({ message: 'Nothing to reorder' });
+
+  let completed = 0;
+  let hasError = false;
+  orders.forEach(item => {
+    db.query("UPDATE roster_sections SET sort_order = ? WHERE id = ?", [item.sort_order, item.id], (err) => {
+      if (err && !hasError) {
+        hasError = true;
+        return res.status(500).json({ message: 'Reorder failed', error: err });
+      }
+      completed++;
+      if (completed === orders.length && !hasError) {
+        // Also update section_order on members of those sections
+        db.query("SELECT id, name, sort_order FROM roster_sections", (err2, sections) => {
+          if (!err2) {
+            sections.forEach(sec => {
+              db.query("UPDATE roster_members SET section_order = ? WHERE section = ?", [sec.sort_order, sec.name]);
+            });
+          }
+        });
+        res.json({ message: 'Sections reorder completed' });
+      }
+    });
+  });
+});
+
+
+// ════════════ GOVT CHAIN OF COMMAND API ════════════
+
+const defaultChainOfCommandData = `The Government of Paraiso
+Structure • Leadership • Accountability
+
+
+Introduction
+
+The Government of Paraiso serves as the executive authority responsible for maintaining structure, organization, and oversight across the community.
+
+Instead of having one person manage every department, responsibilities are divided between executive offices and specialized management teams.
+
+
+Executive Leadership
+
+President
+The highest-ranking official within the Government of Paraiso. The President sets the overall vision of the community and has final authority over major decisions, appointments, and policies.
+
+Vice President
+The second-highest executive official. The Vice President assists the President with government operations and acts on behalf of the President when necessary.
+
+
+Executive Departments
+
+Secretary of Defense
+Oversees all law enforcement and emergency service departments.
+
+Reports Under Secretary of Defense:
+
+Admin Personnel
+• Helper Management
+
+Faction Management
+• Paraiso Police Department
+• Federal Bureau of Investigation
+• Paraiso Fire & Medical Department
+• National Guard
+• San Andreas News
+
+
+Admin Personnel assists the Secretary of Defense in keeping Government employees on the right track. This includes professionalism, honor & loyalty. Aswel as issuing any punishments if any Government employees break the rules and or laws. Faction Management assists faction leaders, monitors activity, reviews department performance, and reports directly to the Secretary of Defense.
+
+
+Secretary of State
+Oversees all civilian and criminal organizations operating throughout Paraiso.
+
+Reports Under Secretary of State:
+
+Gang Management
+• All Official Criminal Organizations
+
+Civilian Management
+• Paraiso News
+• Taxi Services
+• Future Civilian Organizations
+
+Gang Management works with gang leaders, their applications, and reports directly to the Secretary of State.
+
+
+Governor of Economic & Development
+Oversees the economic development of Paraiso, including businesses, commercial enterprises, and economic affairs.
+
+Reports Under Governor:
+
+Business Management
+• Business Applications
+• Ownership Transfers
+• Commercial Disputes
+• Business Owner Support
+
+Business Management handles the daily business process while the Governor oversees the overall economy and commercial growth of Paraiso.
+
+
+Governor of City Relations
+Oversees the City relations of Paraiso, including complaints, appeals, and city helper organisations.
+
+Reports Under Governor:
+
+Community Management
+• Ban Appeals
+• Warning Appeals
+• Complaints
+
+Helper Management
+• Helper Applications
+• Helper Complaints
+
+Community Management handles the daily community issues and appeals. Helper Management handles the daily tasks and management of all Helper employees, while the Governor oversees the overall relations between the Government & Citizens.
+
+
+Why This System Exists
+
+This government system is built around delegation and accountability.
+
+Each executive position oversees a specific area of the server:
+
+Secretary of Defense
+→ Government factions and emergency services.
+
+Secretary of State
+→ Gangs, civilian factions, and community organizations.
+
+Governor
+→ Businesses, economy, and commercial affairs.
+
+This allows every faction, gang, civilian organization, and business to receive proper leadership without one person having to manage everything directly.
+
+
+
+Brian Gutierrez
+
+President of the United States of Paraiso
+
+Office of the President`;
+
+// GET /roster/chain-of-command — public
+app.get('/roster/chain-of-command', (req, res) => {
+  const createTableSql = `
+    CREATE TABLE IF NOT EXISTS page_contents (
+      page_key VARCHAR(100) PRIMARY KEY,
+      content LONGTEXT NULL,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    );
+  `;
+  db.query(createTableSql, (err) => {
+    if (err) return res.status(500).json({ message: 'Failed to ensure page_contents table', error: err });
+
+    db.query("SELECT content FROM page_contents WHERE page_key = 'govt-chain-of-command'", (err2, results) => {
+      if (err2) return res.status(500).json({ message: 'DB error', error: err2 });
+
+      if (results && results.length > 0) {
+        return res.json({ content: results[0].content });
+      }
+
+      // Seed default content
+      db.query("INSERT INTO page_contents (page_key, content) VALUES ('govt-chain-of-command', ?)", [defaultChainOfCommandData], (err3) => {
+        if (err3) return res.status(500).json({ message: 'Failed to seed default content', error: err3 });
+        res.json({ content: defaultChainOfCommandData });
+      });
+    });
+  });
+});
+
+// PUT /roster/chain-of-command — admin only
+app.put('/roster/chain-of-command', verifyAdmin, (req, res) => {
+  const { content } = req.body;
+  if (!content) return res.status(400).json({ message: 'Content is required' });
+
+  const sql = `
+    INSERT INTO page_contents (page_key, content) 
+    VALUES ('govt-chain-of-command', ?) 
+    ON DUPLICATE KEY UPDATE content = ?
+  `;
+  db.query(sql, [content, content], (err) => {
+    if (err) return res.status(500).json({ message: 'Failed to save chain of command data', error: err });
+    res.json({ message: 'Chain of command updated successfully' });
+  });
+});
+
+
 // ─── GET / ────────────────────────────────────────────────
 app.get('/', (req, res) => res.send('Server is running and working perfectly!'));
 
