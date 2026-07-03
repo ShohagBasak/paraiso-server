@@ -240,6 +240,27 @@ app.put('/users/:id/role', verifyAdmin, (req, res) => {
   });
 });
 
+// DELETE /users/:id — delete user (admin only)
+app.delete('/users/:id', verifyAdmin, (req, res) => {
+  const targetId = req.params.id;
+
+  // Prevent admins from deleting themselves
+  if (parseInt(targetId) === parseInt(req.user.id)) {
+    return res.status(400).json({ message: 'You cannot delete your own admin account.' });
+  }
+
+  db.query("DELETE FROM users WHERE id = ?", [targetId], (err, result) => {
+    if (err) {
+      console.error("Delete user error:", err);
+      return res.status(500).json({ message: 'Failed to delete user' });
+    }
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    res.json({ message: 'User deleted successfully' });
+  });
+});
+
 // ════════════════════════════════════════════════════════════
 // ANNOUNCEMENT ENDPOINTS
 // ════════════════════════════════════════════════════════════
