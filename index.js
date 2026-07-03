@@ -8,23 +8,18 @@ const jwt = require('jsonwebtoken');
 
 const app = express();
 
-const allowedOrigins = [
-  'https://pgaming.net',
-  'https://www.pgaming.net',
-  'https://api.pgaming.net',
-  'http://localhost:5173'
-];
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "https://pgaming.net");
+  res.header("Access-Control-Allow-Credentials", "true");
+  res.header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
-app.use(cors({
-  origin: function (origin, callback) {
-    if (!origin || allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error("Not allowed by CORS"));
-    }
-  },
-  credentials: true
-}));
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+
+  next();
+});
 
 const isProduction = process.env.NODE_ENV === 'production' || (process.env.FRONTEND_URL && !process.env.FRONTEND_URL.includes('localhost'));
 const cookieOptions = {
