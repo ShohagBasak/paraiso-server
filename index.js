@@ -446,22 +446,6 @@ app.delete('/staff/:id', verifyAdmin, (req, res) => {
   });
 });
 
-// PUT /staff/:id — edit staff member (admin only)
-app.put('/staff/:id', verifyAdmin, (req, res) => {
-  const { name, category, role, country, image_url } = req.body;
-  if (!name || !category) return res.status(400).json({ message: 'Name and Category are required' });
-
-  db.query(
-    "UPDATE staff SET name = ?, category = ?, role = ?, country = ?, image_url = ? WHERE id = ?",
-    [name, category, role || '', country || '', image_url || '', req.params.id],
-    (err, result) => {
-      if (err) return res.status(500).json({ message: 'Failed to update staff member: ' + err.message });
-      if (result.affectedRows === 0) return res.status(404).json({ message: 'Staff member not found' });
-      res.json({ message: 'Staff member updated successfully', staff: { id: req.params.id, name, category, role, country, image_url } });
-    }
-  );
-});
-
 // PUT /staff/reorder — bulk-update sorting sequence (admin only)
 app.put('/staff/reorder', verifyAdmin, (req, res) => {
   const { orders } = req.body;
@@ -484,6 +468,22 @@ app.put('/staff/reorder', verifyAdmin, (req, res) => {
       }
     });
   });
+});
+
+// PUT /staff/:id — edit staff member (admin only)
+app.put('/staff/:id', verifyAdmin, (req, res) => {
+  const { name, category, role, country, image_url } = req.body;
+  if (!name || !category) return res.status(400).json({ message: 'Name and Category are required' });
+
+  db.query(
+    "UPDATE staff SET name = ?, category = ?, role = ?, country = ?, image_url = ? WHERE id = ?",
+    [name, category, role || '', country || '', image_url || '', req.params.id],
+    (err, result) => {
+      if (err) return res.status(500).json({ message: 'Failed to update staff member: ' + err.message });
+      if (result.affectedRows === 0) return res.status(404).json({ message: 'Staff member not found' });
+      res.json({ message: 'Staff member updated successfully', staff: { id: req.params.id, name, category, role, country, image_url } });
+    }
+  );
 });
 
 
@@ -562,6 +562,30 @@ app.delete('/staff-roles/:id', verifyAdmin, (req, res) => {
   });
 });
 
+// PUT /staff-roles/reorder — bulk update sorting of categories (admin only)
+app.put('/staff-roles/reorder', verifyAdmin, (req, res) => {
+  const { orders } = req.body;
+  if (!Array.isArray(orders)) return res.status(400).json({ message: 'Invalid data' });
+
+  let completed = 0;
+  let hasError = false;
+
+  if (orders.length === 0) return res.json({ message: 'Order updated' });
+
+  orders.forEach((item) => {
+    db.query("UPDATE staff_roles SET sort_order = ? WHERE id = ?", [item.sort_order, item.id], (err) => {
+      if (err && !hasError) {
+        hasError = true;
+        return res.status(500).json({ message: 'Failed to update role order' });
+      }
+      completed++;
+      if (completed === orders.length && !hasError) {
+        res.json({ message: 'Role ordering updated successfully' });
+      }
+    });
+  });
+});
+
 // PUT /staff-roles/:id — edit department name/color/icon (admin only)
 app.put('/staff-roles/:id', verifyAdmin, (req, res) => {
   const { name, color, icon_name } = req.body;
@@ -588,30 +612,6 @@ app.put('/staff-roles/:id', verifyAdmin, (req, res) => {
   });
 });
 
-// PUT /staff-roles/reorder — bulk update sorting of categories (admin only)
-app.put('/staff-roles/reorder', verifyAdmin, (req, res) => {
-  const { orders } = req.body;
-  if (!Array.isArray(orders)) return res.status(400).json({ message: 'Invalid data' });
-
-  let completed = 0;
-  let hasError = false;
-
-  if (orders.length === 0) return res.json({ message: 'Order updated' });
-
-  orders.forEach((item) => {
-    db.query("UPDATE staff_roles SET sort_order = ? WHERE id = ?", [item.sort_order, item.id], (err) => {
-      if (err && !hasError) {
-        hasError = true;
-        return res.status(500).json({ message: 'Failed to update role order' });
-      }
-      completed++;
-      if (completed === orders.length && !hasError) {
-        res.json({ message: 'Role ordering updated successfully' });
-      }
-    });
-  });
-});
-
 
 // ─── GOVERNMENT ROSTER ────────────────────────────────────
 
@@ -621,6 +621,26 @@ db.query("SHOW COLUMNS FROM roster_members LIKE 'color'", (err, results) => {
     db.query("ALTER TABLE roster_members ADD COLUMN color VARCHAR(50) DEFAULT NULL", (err2) => {
       if (err2) console.error("Error adding color column to roster_members:", err2);
       else console.log("Added color column to roster_members table.");
+    });
+  }
+});
+
+// Auto-add section_order column to roster_members table if missing
+db.query("SHOW COLUMNS FROM roster_members LIKE 'section_order'", (err, results) => {
+  if (!err && (!results || results.length === 0)) {
+    db.query("ALTER TABLE roster_members ADD COLUMN section_order INT DEFAULT 0", (err2) => {
+      if (err2) console.error("Error adding section_order column to roster_members:", err2);
+      else console.log("Added section_order column to roster_members table.");
+    });
+  }
+});
+
+// Auto-add sort_order column to roster_members table if missing
+db.query("SHOW COLUMNS FROM roster_members LIKE 'sort_order'", (err, results) => {
+  if (!err && (!results || results.length === 0)) {
+    db.query("ALTER TABLE roster_members ADD COLUMN sort_order INT DEFAULT 0", (err2) => {
+      if (err2) console.error("Error adding sort_order column to roster_members:", err2);
+      else console.log("Added sort_order column to roster_members table.");
     });
   }
 });
@@ -650,24 +670,6 @@ app.post('/roster', verifyAdmin, (req, res) => {
   });
 });
 
-// PUT /roster/:id — admin only, update a member
-app.put('/roster/:id', verifyAdmin, (req, res) => {
-  const { section, title, name, description, section_order, sort_order, color } = req.body;
-  const sql = "UPDATE roster_members SET section=?, title=?, name=?, description=?, section_order=?, sort_order=?, color=? WHERE id=?";
-  db.query(sql, [section, title, name || 'Vacant', description || '', section_order || 0, sort_order || 0, color || null, req.params.id], (err) => {
-    if (err) return res.status(500).json({ message: 'Failed to update member', error: err });
-    res.json({ message: 'Member updated' });
-  });
-});
-
-// DELETE /roster/:id — admin only
-app.delete('/roster/:id', verifyAdmin, (req, res) => {
-  db.query("DELETE FROM roster_members WHERE id = ?", [req.params.id], (err) => {
-    if (err) return res.status(500).json({ message: 'Failed to delete member', error: err });
-    res.json({ message: 'Member deleted' });
-  });
-});
-
 // PUT /roster/reorder — admin only, bulk update sort_order
 app.put('/roster/reorder', verifyAdmin, (req, res) => {
   const { orders } = req.body;
@@ -689,6 +691,25 @@ app.put('/roster/reorder', verifyAdmin, (req, res) => {
     });
   });
 });
+
+// PUT /roster/:id — admin only, update a member
+app.put('/roster/:id', verifyAdmin, (req, res) => {
+  const { section, title, name, description, section_order, sort_order, color } = req.body;
+  const sql = "UPDATE roster_members SET section=?, title=?, name=?, description=?, section_order=?, sort_order=?, color=? WHERE id=?";
+  db.query(sql, [section, title, name || 'Vacant', description || '', section_order || 0, sort_order || 0, color || null, req.params.id], (err) => {
+    if (err) return res.status(500).json({ message: 'Failed to update member', error: err });
+    res.json({ message: 'Member updated' });
+  });
+});
+
+// DELETE /roster/:id — admin only
+app.delete('/roster/:id', verifyAdmin, (req, res) => {
+  db.query("DELETE FROM roster_members WHERE id = ?", [req.params.id], (err) => {
+    if (err) return res.status(500).json({ message: 'Failed to delete member', error: err });
+    res.json({ message: 'Member deleted' });
+  });
+});
+
 
 
 // GET /roster/sections — public (with auto-migration/seeding if empty)
@@ -718,6 +739,13 @@ app.get('/roster/sections', (req, res) => {
     db.query("SHOW COLUMNS FROM roster_sections LIKE 'icon'", (errIcon, cols) => {
       if (!errIcon && (!cols || cols.length === 0)) {
         db.query("ALTER TABLE roster_sections ADD COLUMN icon VARCHAR(50) DEFAULT NULL");
+      }
+    });
+
+    // Double check sort_order column exists
+    db.query("SHOW COLUMNS FROM roster_sections LIKE 'sort_order'", (errSort, cols) => {
+      if (!errSort && (!cols || cols.length === 0)) {
+        db.query("ALTER TABLE roster_sections ADD COLUMN sort_order INT DEFAULT 0");
       }
     });
 
@@ -778,6 +806,50 @@ app.post('/roster/sections', verifyAdmin, (req, res) => {
   });
 });
 
+// PUT /roster/sections/reorder — admin only
+app.put('/roster/sections/reorder', verifyAdmin, (req, res) => {
+  const { orders } = req.body;
+  console.log("Roster sections reorder request received. Orders payload:", orders);
+  
+  if (!Array.isArray(orders) || orders.length === 0)
+    return res.json({ message: 'Nothing to reorder' });
+
+  let completed = 0;
+  let hasError = false;
+  
+  orders.forEach(item => {
+    db.query("UPDATE roster_sections SET sort_order = ? WHERE id = ?", [item.sort_order, item.id], (err, results) => {
+      if (err) {
+        console.error(`Error updating roster_sections sort_order for ID ${item.id}:`, err);
+        if (!hasError) {
+          hasError = true;
+          return res.status(500).json({ message: 'Reorder failed', error: err.message });
+        }
+      }
+      
+      if (!hasError) {
+        completed++;
+        if (completed === orders.length) {
+          // Also update section_order on members of those sections
+          db.query("SELECT id, name, sort_order FROM roster_sections", (err2, sections) => {
+            if (err2) {
+              console.error("Error fetching roster_sections for cascade:", err2);
+            } else {
+              sections.forEach(sec => {
+                db.query("UPDATE roster_members SET section_order = ? WHERE section = ?", [sec.sort_order, sec.name], (err3) => {
+                  if (err3) console.error(`Error updating section_order for member section '${sec.name}':`, err3);
+                });
+              });
+            }
+          });
+          console.log("Roster sections reordered successfully");
+          res.json({ message: 'Sections reorder completed' });
+        }
+      }
+    });
+  });
+});
+
 // PUT /roster/sections/:id — admin only
 app.put('/roster/sections/:id', verifyAdmin, (req, res) => {
   const { name, sort_order, color, icon } = req.body;
@@ -811,36 +883,6 @@ app.delete('/roster/sections/:id', verifyAdmin, (req, res) => {
       db.query("DELETE FROM roster_members WHERE section = ?", [sectionName], (err3) => {
         res.json({ message: 'Section and its members deleted' });
       });
-    });
-  });
-});
-
-// PUT /roster/sections/reorder — admin only
-app.put('/roster/sections/reorder', verifyAdmin, (req, res) => {
-  const { orders } = req.body;
-  if (!Array.isArray(orders) || orders.length === 0)
-    return res.json({ message: 'Nothing to reorder' });
-
-  let completed = 0;
-  let hasError = false;
-  orders.forEach(item => {
-    db.query("UPDATE roster_sections SET sort_order = ? WHERE id = ?", [item.sort_order, item.id], (err) => {
-      if (err && !hasError) {
-        hasError = true;
-        return res.status(500).json({ message: 'Reorder failed', error: err });
-      }
-      completed++;
-      if (completed === orders.length && !hasError) {
-        // Also update section_order on members of those sections
-        db.query("SELECT id, name, sort_order FROM roster_sections", (err2, sections) => {
-          if (!err2) {
-            sections.forEach(sec => {
-              db.query("UPDATE roster_members SET section_order = ? WHERE section = ?", [sec.sort_order, sec.name]);
-            });
-          }
-        });
-        res.json({ message: 'Sections reorder completed' });
-      }
     });
   });
 });
