@@ -177,7 +177,11 @@ app.post('/logout', (req, res) => {
 
 app.get('/banners', (req, res) => {
   db.query("SELECT * FROM banner_slides ORDER BY id DESC", (err, results) => {
-    if (err) return res.status(500).json({ message: 'Failed to fetch banners' });
+    if (err) {
+      console.error(err);
+      return res.status(500).json(err);
+    }
+
     res.json(results);
   });
 });
@@ -301,7 +305,11 @@ app.put('/users/:id/role', verifyAdmin, (req, res) => {
 
 app.get('/announcements', (req, res) => {
   db.query("SELECT * FROM announcements ORDER BY id DESC", (err, results) => {
-    if (err) return res.status(500).json({ message: 'Failed to fetch announcements' });
+    if (err) {
+      console.error(err);
+      return res.status(500).json(err);
+    }
+
     res.json(results);
   });
 });
