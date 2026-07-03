@@ -11,7 +11,7 @@ const app = express();
 const allowedOrigins = [
   'https://pgaming.net',
   'https://www.pgaming.net',
-  'https://chocolate-jellyfish-615049.hostingersite.com',
+  'https://api.pgaming.net',
   'http://localhost:5173'
 ];
 
