@@ -300,7 +300,7 @@ app.put('/users/:id/role', verifyAdmin, (req, res) => {
 // ════════════════════════════════════════════════════════════
 
 app.get('/announcements', (req, res) => {
-  db.query("SELECT * FROM announcements ORDER BY sort_order ASC, id DESC", (err, results) => {
+  db.query("SELECT * FROM announcements ORDER BY id DESC", (err, results) => {
     if (err) return res.status(500).json({ message: 'Failed to fetch announcements' });
     res.json(results);
   });
