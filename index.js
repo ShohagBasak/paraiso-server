@@ -62,19 +62,67 @@ app.get('/me', verifyToken, (req, res) => {
 
 // ─── POST /register ───────────────────────────────────────
 app.post('/register', async (req, res) => {
-  const { username, email, password } = req.body;
-  const allowedDomain = "@gmail.com";
-  if (!email.endsWith(allowedDomain)) {
-    return res.status(403).json({ message: "Only Gmail addresses are allowed!" });
+  try {
+    console.log("========== REGISTER HIT ==========");
+    console.log("Body:", req.body);
+
+    const { username, email, password } = req.body;
+    const allowedDomain = "@gmail.com";
+
+    if (!email.endsWith(allowedDomain)) {
+      console.log("Invalid email domain");
+      return res.status(403).json({
+        message: "Only Gmail addresses are allowed!"
+      });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const sql = `
+      INSERT INTO users (username, email, password_hash)
+      VALUES (?, ?, ?)
+    `;
+
+    db.query(sql, [username, email, hashedPassword], (err, result) => {
+      if (err) {
+        console.error("DATABASE ERROR:");
+        console.error(err);
+        return res.status(500).json({
+          message: "Registration failed. Email may already exist."
+        });
+      }
+
+      const token = jwt.sign(
+        {
+          id: result.insertId,
+          email,
+          role: "user"
+        },
+        process.env.JWT_SECRET,
+        { expiresIn: "7d" }
+      );
+
+      res.cookie("token", token, cookieOptions);
+      console.log("User registered successfully:", email);
+
+      res.status(201).json({
+        user: {
+          id: result.insertId,
+          username,
+          email,
+          role: "user"
+        }
+      });
+    });
+
+  } catch (err) {
+    console.error("REGISTER CRASH:");
+    console.error(err);
+
+    res.status(500).json({
+      message: err.message
+    });
   }
-  const hashedPassword = await bcrypt.hash(password, 10);
-  const sql = "INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)";
-  db.query(sql, [username, email, hashedPassword], (err, result) => {
-    if (err) return res.status(500).json({ message: "Registration failed. Email may already exist." });
-    const token = jwt.sign({ id: result.insertId, email, role: 'user' }, process.env.JWT_SECRET, { expiresIn: '7d' });
-    res.cookie('token', token, cookieOptions);
-    res.status(201).json({ user: { id: result.insertId, username, email, role: 'user' } });
-  });
 });
 
 // ─── POST /login ──────────────────────────────────────────
@@ -260,7 +308,6 @@ app.delete('/users/:id', verifyAdmin, (req, res) => {
     res.json({ message: 'User deleted successfully' });
   });
 });
-
 // ════════════════════════════════════════════════════════════
 // ANNOUNCEMENT ENDPOINTS
 // ════════════════════════════════════════════════════════════
