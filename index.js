@@ -176,7 +176,7 @@ app.post('/logout', (req, res) => {
 // ════════════════════════════════════════════════════════════
 
 app.get('/banners', (req, res) => {
-  db.query("SELECT * FROM banner_slides ORDER BY sort_order ASC, id DESC", (err, results) => {
+  db.query("SELECT * FROM banner_slides ORDER BY id DESC", (err, results) => {
     if (err) return res.status(500).json({ message: 'Failed to fetch banners' });
     res.json(results);
   });
