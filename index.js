@@ -476,14 +476,14 @@ app.put('/announcements/reorder', verifyPermission('announcements'), (req, res) 
 });
 
 app.post('/announcements', verifyPermission('announcements'), (req, res) => {
-  const { title, description, image_url, link, title_color, description_color, title_size, description_size } = req.body;
+  const { title, description, image_url, link, title_color, description_color, title_size, description_size, image_shape } = req.body;
   if (!title) return res.status(400).json({ message: 'Title is required' });
-
+ 
   db.query("SELECT MAX(sort_order) as maxOrder FROM announcements", (err, orderResult) => {
     const nextOrder = (orderResult && orderResult[0]?.maxOrder !== null) ? orderResult[0].maxOrder + 1 : 0;
-
+ 
     db.query(
-      "INSERT INTO announcements (title, description, image_url, link, sort_order, title_color, description_color, title_size, description_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO announcements (title, description, image_url, link, sort_order, title_color, description_color, title_size, description_size, image_shape) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       [
         title, 
         description || '', 
@@ -493,29 +493,30 @@ app.post('/announcements', verifyPermission('announcements'), (req, res) => {
         title_color || '#ffffff',
         description_color || '#cbd5e1',
         title_size || 'text-xl md:text-2xl',
-        description_size || 'text-sm'
+        description_size || 'text-sm',
+        image_shape || 'rectangle'
       ],
-      (err, result) => {
-        if (err) return res.status(500).json({ message: 'Failed to add announcement: ' + err.message });
-        res.status(201).json({ id: result.insertId, title, description, image_url, link, sort_order: nextOrder, title_color, description_color, title_size, description_size });
+      (errInsert, result) => {
+        if (errInsert) return res.status(500).json({ message: 'Failed to add announcement: ' + errInsert.message });
+        res.status(201).json({ id: result.insertId, title, description, image_url, link, sort_order: nextOrder, title_color, description_color, title_size, description_size, image_shape });
       }
     );
   });
 });
-
+ 
 app.delete('/announcements/:id', verifyPermission('announcements'), (req, res) => {
   db.query("DELETE FROM announcements WHERE id = ?", [req.params.id], (err) => {
     if (err) return res.status(500).json({ message: 'Failed to delete announcement' });
     res.json({ message: 'Announcement deleted' });
   });
 });
-
+ 
 // PUT /announcements/:id — edit announcement
 app.put('/announcements/:id', verifyPermission('announcements'), (req, res) => {
-  const { title, description, image_url, link, title_color, description_color, title_size, description_size } = req.body;
+  const { title, description, image_url, link, title_color, description_color, title_size, description_size, image_shape } = req.body;
   if (!title) return res.status(400).json({ message: 'Title is required' });
   db.query(
-    "UPDATE announcements SET title = ?, description = ?, image_url = ?, link = ?, title_color = ?, description_color = ?, title_size = ?, description_size = ? WHERE id = ?",
+    "UPDATE announcements SET title = ?, description = ?, image_url = ?, link = ?, title_color = ?, description_color = ?, title_size = ?, description_size = ?, image_shape = ? WHERE id = ?",
     [
       title, 
       description || '', 
@@ -525,6 +526,7 @@ app.put('/announcements/:id', verifyPermission('announcements'), (req, res) => {
       description_color || '#cbd5e1',
       title_size || 'text-xl md:text-2xl',
       description_size || 'text-sm',
+      image_shape || 'rectangle',
       req.params.id
     ],
     (err, result) => {
@@ -532,7 +534,7 @@ app.put('/announcements/:id', verifyPermission('announcements'), (req, res) => {
       if (result.affectedRows === 0) return res.status(404).json({ message: 'Announcement not found' });
       res.json({ 
         message: 'Announcement updated successfully', 
-        announcement: { id: req.params.id, title, description, image_url, link, title_color, description_color, title_size, description_size } 
+        announcement: { id: req.params.id, title, description, image_url, link, title_color, description_color, title_size, description_size, image_shape } 
       });
     }
   );
@@ -1245,6 +1247,16 @@ db.query("SHOW COLUMNS FROM helper_roster_members LIKE 'name_color'", (err, resu
     db.query("ALTER TABLE helper_roster_members ADD COLUMN name_color VARCHAR(50) DEFAULT NULL", (err2) => {
       if (err2) console.error("Error adding name_color column to helper_roster_members:", err2);
       else console.log("Added name_color column to helper_roster_members table.");
+    });
+  }
+});
+
+// Auto-add image_shape column to announcements table if missing
+db.query("SHOW COLUMNS FROM announcements LIKE 'image_shape'", (err, results) => {
+  if (!err && (!results || results.length === 0)) {
+    db.query("ALTER TABLE announcements ADD COLUMN image_shape VARCHAR(50) DEFAULT 'rectangle'", (err2) => {
+      if (err2) console.error("Error adding image_shape column to announcements:", err2);
+      else console.log("Added image_shape column to announcements table.");
     });
   }
 });
