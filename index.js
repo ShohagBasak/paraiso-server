@@ -29,6 +29,46 @@ const cookieOptions = {
 app.use(express.json());
 app.use(cookieParser());
 
+// ─── Initialize Permissions Table & Auto-promote Master Admin ───
+db.query(`
+  CREATE TABLE IF NOT EXISTS admin_permissions (
+    user_id INT NOT NULL,
+    permission_key VARCHAR(100) NOT NULL,
+    PRIMARY KEY (user_id, permission_key),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  )
+`, (err) => {
+  if (err) console.error("Error creating admin_permissions table:", err);
+  else {
+    console.log("Verified admin_permissions table exists.");
+    // Auto-promote: If there is no user with role 'master', promote the first admin or user with lowest ID
+    db.query("SELECT 1 FROM users WHERE role = 'master'", (err2, masterResults) => {
+      if (!err2 && (!masterResults || masterResults.length === 0)) {
+        db.query("SELECT id FROM users WHERE role = 'admin' ORDER BY id ASC LIMIT 1", (err3, adminResults) => {
+          let targetUserId = null;
+          if (!err3 && adminResults && adminResults.length > 0) {
+            targetUserId = adminResults[0].id;
+          } else {
+            db.query("SELECT id FROM users ORDER BY id ASC LIMIT 1", (err4, userResults) => {
+              if (!err4 && userResults && userResults.length > 0) {
+                targetUserId = userResults[0].id;
+                db.query("UPDATE users SET role = 'master' WHERE id = ?", [targetUserId], (err5) => {
+                  if (!err5) console.log(`Auto-promoted user ID ${targetUserId} to 'master' role.`);
+                });
+              }
+            });
+          }
+          if (targetUserId && !err3 && adminResults && adminResults.length > 0) {
+            db.query("UPDATE users SET role = 'master' WHERE id = ?", [targetUserId], (err5) => {
+              if (!err5) console.log(`Auto-promoted user ID ${targetUserId} to 'master' role.`);
+            });
+          }
+        });
+      }
+    });
+  }
+});
+
 // ─── verifyToken Middleware ────────────────────────────────
 function verifyToken(req, res, next) {
   const token = req.cookies.token;
@@ -44,11 +84,48 @@ function verifyToken(req, res, next) {
 // ─── verifyAdmin Middleware ────────────────────────────────
 function verifyAdmin(req, res, next) {
   verifyToken(req, res, () => {
-    if (req.user?.role !== 'admin') {
+    if (req.user?.role !== 'admin' && req.user?.role !== 'master') {
       return res.status(403).json({ message: 'Admin access required' });
     }
     next();
   });
+}
+
+// ─── verifyMaster Middleware ───────────────────────────────
+function verifyMaster(req, res, next) {
+  verifyToken(req, res, () => {
+    if (req.user?.role !== 'master') {
+      return res.status(403).json({ message: 'Master Admin access required' });
+    }
+    next();
+  });
+}
+
+// ─── verifyPermission Middleware ───────────────────────────
+function verifyPermission(permissionKey) {
+  return (req, res, next) => {
+    verifyToken(req, res, () => {
+      if (req.user?.role === 'master') {
+        return next();
+      }
+      if (req.user?.role === 'admin') {
+        db.query(
+          "SELECT 1 FROM admin_permissions WHERE user_id = ? AND permission_key = ?",
+          [req.user.id, permissionKey],
+          (err, results) => {
+            if (!err && results && results.length > 0) {
+              return next();
+            }
+            return res.status(403).json({ 
+              message: `Access denied. You do not have permission to manage this section (${permissionKey}).` 
+            });
+          }
+        );
+      } else {
+        return res.status(403).json({ message: 'Admin access required' });
+      }
+    });
+  };
 }
 
 // ─── GET /me ──────────────────────────────────────────────
@@ -56,7 +133,12 @@ app.get('/me', verifyToken, (req, res) => {
   const sql = "SELECT id, username, email, role FROM users WHERE id = ?";
   db.query(sql, [req.user.id], (err, results) => {
     if (err || results.length === 0) return res.status(404).json({ message: 'User not found' });
-    res.json({ user: results[0] });
+    const user = results[0];
+    
+    db.query("SELECT permission_key FROM admin_permissions WHERE user_id = ?", [user.id], (err2, permResults) => {
+      user.permissions = !err2 && permResults ? permResults.map(p => p.permission_key) : [];
+      res.json({ user });
+    });
   });
 });
 
@@ -136,7 +218,11 @@ app.post('/login', (req, res) => {
     const { id, username, role } = results[0];
     const token = jwt.sign({ id, email, role }, process.env.JWT_SECRET, { expiresIn: '7d' });
     res.cookie('token', token, cookieOptions);
-    res.json({ user: { id, username, email, role } });
+    
+    db.query("SELECT permission_key FROM admin_permissions WHERE user_id = ?", [id], (err2, permResults) => {
+      const permissions = !err2 && permResults ? permResults.map(p => p.permission_key) : [];
+      res.json({ user: { id, username, email, role, permissions } });
+    });
   });
 });
 
@@ -176,7 +262,8 @@ app.get('/banners', (req, res) => {
 });
 
 // PUT /banners/reorder — update sort order (admin only)
-app.put('/banners/reorder', verifyAdmin, (req, res) => {
+// PUT /banners/reorder — update sort order (admin only with permission)
+app.put('/banners/reorder', verifyPermission('banners'), (req, res) => {
   const { orders } = req.body;
   if (!Array.isArray(orders)) return res.status(400).json({ message: 'Invalid data' });
 
@@ -199,7 +286,7 @@ app.put('/banners/reorder', verifyAdmin, (req, res) => {
   });
 });
 
-app.post('/banners', verifyAdmin, (req, res) => {
+app.post('/banners', verifyPermission('banners'), (req, res) => {
   const { title, subtitle, image_url, title_color, subtitle_color, title_size, subtitle_size } = req.body;
   
   // Find current maximum sort order to append new slide to the bottom
@@ -226,7 +313,7 @@ app.post('/banners', verifyAdmin, (req, res) => {
   });
 });
 
-app.delete('/banners/:id', verifyAdmin, (req, res) => {
+app.delete('/banners/:id', verifyPermission('banners'), (req, res) => {
   db.query("DELETE FROM banner_slides WHERE id = ?", [req.params.id], (err) => {
     if (err) return res.status(500).json({ message: 'Failed to delete banner' });
     res.json({ message: 'Banner deleted' });
@@ -234,7 +321,7 @@ app.delete('/banners/:id', verifyAdmin, (req, res) => {
 });
 
 // PUT /banners/:id — edit banner
-app.put('/banners/:id', verifyAdmin, (req, res) => {
+app.put('/banners/:id', verifyPermission('banners'), (req, res) => {
   const { title, subtitle, image_url, title_color, subtitle_color, title_size, subtitle_size } = req.body;
   db.query(
     "UPDATE banner_slides SET title = ?, subtitle = ?, image_url = ?, title_color = ?, subtitle_color = ?, title_size = ?, subtitle_size = ? WHERE id = ?",
@@ -264,8 +351,8 @@ app.put('/banners/:id', verifyAdmin, (req, res) => {
 // USER MANAGEMENT ENDPOINTS
 // ════════════════════════════════════════════════════════════
 
-// GET /users — all users (admin only)
-app.get('/users', verifyAdmin, (req, res) => {
+// GET /users — all users (master admin only)
+app.get('/users', verifyMaster, (req, res) => {
   db.query("SELECT id, username, email, role FROM users ORDER BY id DESC", (err, results) => {
     if (err) {
       console.error(err);
@@ -275,21 +362,66 @@ app.get('/users', verifyAdmin, (req, res) => {
   });
 });
 
-// PUT /users/:id/role — assign role (admin only)
-app.put('/users/:id/role', verifyAdmin, (req, res) => {
+// PUT /users/:id/role — assign role (master admin only)
+app.put('/users/:id/role', verifyMaster, (req, res) => {
   const { role } = req.body;
-  if (!['user', 'admin'].includes(role)) {
-    return res.status(400).json({ message: 'Invalid role. Must be "user" or "admin"' });
+  if (!['user', 'admin', 'master'].includes(role)) {
+    return res.status(400).json({ message: 'Invalid role. Must be "user", "admin", or "master"' });
   }
   db.query("UPDATE users SET role = ? WHERE id = ?", [role, req.params.id], (err, result) => {
     if (err) return res.status(500).json({ message: 'Failed to update role' });
     if (result.affectedRows === 0) return res.status(404).json({ message: 'User not found' });
+    
+    // If upgraded to master, clear individual permissions table as master has all implicitly
+    if (role === 'master' || role === 'user') {
+      db.query("DELETE FROM admin_permissions WHERE user_id = ?", [req.params.id]);
+    } else if (role === 'admin') {
+      // Auto-assign all permissions by default for sub-admins
+      const allPerms = ['banners', 'announcements', 'staff', 'roster', 'helper-roster', 'faqs'];
+      db.query("DELETE FROM admin_permissions WHERE user_id = ?", [req.params.id], (errClear) => {
+        if (!errClear) {
+          const values = allPerms.map(p => [req.params.id, p]);
+          db.query("INSERT INTO admin_permissions (user_id, permission_key) VALUES ?", [values]);
+        }
+      });
+    }
+    
     res.json({ message: `Role updated to ${role}` });
   });
 });
 
-// DELETE /users/:id — delete user (admin only)
-app.delete('/users/:id', verifyAdmin, (req, res) => {
+// GET /users/:id/permissions — fetch permissions (master admin only)
+app.get('/users/:id/permissions', verifyMaster, (req, res) => {
+  db.query("SELECT permission_key FROM admin_permissions WHERE user_id = ?", [req.params.id], (err, results) => {
+    if (err) return res.status(500).json({ message: 'Failed to fetch permissions' });
+    res.json(results.map(r => r.permission_key));
+  });
+});
+
+// PUT /users/:id/permissions — update permissions (master admin only)
+app.put('/users/:id/permissions', verifyMaster, (req, res) => {
+  const { permissions } = req.body;
+  if (!Array.isArray(permissions)) {
+    return res.status(400).json({ message: 'Permissions must be an array of keys.' });
+  }
+  
+  db.query("DELETE FROM admin_permissions WHERE user_id = ?", [req.params.id], (err) => {
+    if (err) return res.status(500).json({ message: 'Failed to clear old permissions' });
+    
+    if (permissions.length === 0) {
+      return res.json({ message: 'Permissions updated successfully' });
+    }
+    
+    const values = permissions.map(p => [req.params.id, p]);
+    db.query("INSERT INTO admin_permissions (user_id, permission_key) VALUES ?", [values], (err2) => {
+      if (err2) return res.status(500).json({ message: 'Failed to save permissions' });
+      res.json({ message: 'Permissions updated successfully' });
+    });
+  });
+});
+
+// DELETE /users/:id — delete user (master admin only)
+app.delete('/users/:id', verifyMaster, (req, res) => {
   const targetId = req.params.id;
 
   // Prevent admins from deleting themselves
@@ -319,8 +451,8 @@ app.get('/announcements', (req, res) => {
   });
 });
 
-// PUT /announcements/reorder — update announcement order (admin only)
-app.put('/announcements/reorder', verifyAdmin, (req, res) => {
+// PUT /announcements/reorder — update announcement order (admin only with permission)
+app.put('/announcements/reorder', verifyPermission('announcements'), (req, res) => {
   const { orders } = req.body;
   if (!Array.isArray(orders)) return res.status(400).json({ message: 'Invalid data' });
 
@@ -343,7 +475,7 @@ app.put('/announcements/reorder', verifyAdmin, (req, res) => {
   });
 });
 
-app.post('/announcements', verifyAdmin, (req, res) => {
+app.post('/announcements', verifyPermission('announcements'), (req, res) => {
   const { title, description, image_url, link, title_color, description_color, title_size, description_size } = req.body;
   if (!title) return res.status(400).json({ message: 'Title is required' });
 
@@ -371,7 +503,7 @@ app.post('/announcements', verifyAdmin, (req, res) => {
   });
 });
 
-app.delete('/announcements/:id', verifyAdmin, (req, res) => {
+app.delete('/announcements/:id', verifyPermission('announcements'), (req, res) => {
   db.query("DELETE FROM announcements WHERE id = ?", [req.params.id], (err) => {
     if (err) return res.status(500).json({ message: 'Failed to delete announcement' });
     res.json({ message: 'Announcement deleted' });
@@ -379,7 +511,7 @@ app.delete('/announcements/:id', verifyAdmin, (req, res) => {
 });
 
 // PUT /announcements/:id — edit announcement
-app.put('/announcements/:id', verifyAdmin, (req, res) => {
+app.put('/announcements/:id', verifyPermission('announcements'), (req, res) => {
   const { title, description, image_url, link, title_color, description_color, title_size, description_size } = req.body;
   if (!title) return res.status(400).json({ message: 'Title is required' });
   db.query(
@@ -411,6 +543,26 @@ app.put('/announcements/:id', verifyAdmin, (req, res) => {
 // STAFF ROSTER ENDPOINTS
 // ════════════════════════════════════════════════════════════
 
+// Auto-add color column to staff table if missing
+db.query("SHOW COLUMNS FROM staff LIKE 'color'", (err, results) => {
+  if (!err && (!results || results.length === 0)) {
+    db.query("ALTER TABLE staff ADD COLUMN color VARCHAR(50) DEFAULT NULL", (err2) => {
+      if (err2) console.error("Error adding color column to staff table:", err2);
+      else console.log("Added color column to staff table.");
+    });
+  }
+});
+
+// Auto-add name_color column to staff table if missing
+db.query("SHOW COLUMNS FROM staff LIKE 'name_color'", (err, results) => {
+  if (!err && (!results || results.length === 0)) {
+    db.query("ALTER TABLE staff ADD COLUMN name_color VARCHAR(50) DEFAULT NULL", (err2) => {
+      if (err2) console.error("Error adding name_color column to staff table:", err2);
+      else console.log("Added name_color column to staff table.");
+    });
+  }
+});
+
 // GET /staff — fetch all staff ordered by sort_order
 app.get('/staff', (req, res) => {
   db.query("SELECT * FROM staff ORDER BY sort_order ASC, id ASC", (err, results) => {
@@ -420,34 +572,35 @@ app.get('/staff', (req, res) => {
 });
 
 // POST /staff — add a new staff member (admin only)
-app.post('/staff', verifyAdmin, (req, res) => {
-  const { name, category, role, country, image_url } = req.body;
+// POST /staff — add a new staff member (admin only with permission)
+app.post('/staff', verifyPermission('staff'), (req, res) => {
+  const { name, category, role, country, image_url, color, name_color } = req.body;
   if (!name || !category) return res.status(400).json({ message: 'Name and Category are required' });
 
   db.query("SELECT MAX(sort_order) as maxOrder FROM staff", (err, orderResult) => {
     const nextOrder = (orderResult && orderResult[0]?.maxOrder !== null) ? orderResult[0].maxOrder + 1 : 0;
 
     db.query(
-      "INSERT INTO staff (name, role, category, country, image_url, sort_order) VALUES (?, ?, ?, ?, ?, ?)",
-      [name, role || '', category, country || '', image_url || '', nextOrder],
+      "INSERT INTO staff (name, role, category, country, image_url, sort_order, color, name_color) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      [name, role || '', category, country || '', image_url || '', nextOrder, color || null, name_color || null],
       (err, result) => {
         if (err) return res.status(500).json({ message: 'Failed to add staff member: ' + err.message });
-        res.status(201).json({ id: result.insertId, name, category, role, country, image_url, sort_order: nextOrder });
+        res.status(201).json({ id: result.insertId, name, category, role, country, image_url, sort_order: nextOrder, color, name_color });
       }
     );
   });
 });
 
-// DELETE /staff/:id — delete staff member (admin only)
-app.delete('/staff/:id', verifyAdmin, (req, res) => {
+// DELETE /staff/:id — delete staff member (admin only with permission)
+app.delete('/staff/:id', verifyPermission('staff'), (req, res) => {
   db.query("DELETE FROM staff WHERE id = ?", [req.params.id], (err) => {
     if (err) return res.status(500).json({ message: 'Failed to delete staff member' });
     res.json({ message: 'Staff member deleted' });
   });
 });
 
-// PUT /staff/reorder — bulk-update sorting sequence (admin only)
-app.put('/staff/reorder', verifyAdmin, (req, res) => {
+// PUT /staff/reorder — bulk-update sorting sequence (admin only with permission)
+app.put('/staff/reorder', verifyPermission('staff'), (req, res) => {
   const { orders } = req.body;
   if (!Array.isArray(orders)) return res.status(400).json({ message: 'Invalid data' });
 
@@ -470,18 +623,18 @@ app.put('/staff/reorder', verifyAdmin, (req, res) => {
   });
 });
 
-// PUT /staff/:id — edit staff member (admin only)
-app.put('/staff/:id', verifyAdmin, (req, res) => {
-  const { name, category, role, country, image_url } = req.body;
+// PUT /staff/:id — edit staff member (admin only with permission)
+app.put('/staff/:id', verifyPermission('staff'), (req, res) => {
+  const { name, category, role, country, image_url, color, name_color } = req.body;
   if (!name || !category) return res.status(400).json({ message: 'Name and Category are required' });
 
   db.query(
-    "UPDATE staff SET name = ?, category = ?, role = ?, country = ?, image_url = ? WHERE id = ?",
-    [name, category, role || '', country || '', image_url || '', req.params.id],
+    "UPDATE staff SET name = ?, category = ?, role = ?, country = ?, image_url = ?, color = ?, name_color = ? WHERE id = ?",
+    [name, category, role || '', country || '', image_url || '', color || null, name_color || null, req.params.id],
     (err, result) => {
       if (err) return res.status(500).json({ message: 'Failed to update staff member: ' + err.message });
       if (result.affectedRows === 0) return res.status(404).json({ message: 'Staff member not found' });
-      res.json({ message: 'Staff member updated successfully', staff: { id: req.params.id, name, category, role, country, image_url } });
+      res.json({ message: 'Staff member updated successfully', staff: { id: req.params.id, name, category, role, country, image_url, color, name_color } });
     }
   );
 });
@@ -527,8 +680,8 @@ app.get('/staff-roles', (req, res) => {
   });
 });
 
-// POST /staff-roles — create a new department/role (admin only)
-app.post('/staff-roles', verifyAdmin, (req, res) => {
+// POST /staff-roles — create a new department/role (admin only with permission)
+app.post('/staff-roles', verifyPermission('staff'), (req, res) => {
   const { name, color, icon_name } = req.body;
   if (!name) return res.status(400).json({ message: 'Role Name is required' });
 
@@ -546,8 +699,8 @@ app.post('/staff-roles', verifyAdmin, (req, res) => {
   });
 });
 
-// DELETE /staff-roles/:id — remove a department/role (admin only)
-app.delete('/staff-roles/:id', verifyAdmin, (req, res) => {
+// DELETE /staff-roles/:id — remove a department/role (admin only with permission)
+app.delete('/staff-roles/:id', verifyPermission('staff'), (req, res) => {
   db.query("SELECT name FROM staff_roles WHERE id = ?", [req.params.id], (err, oldResult) => {
     if (err || oldResult.length === 0) return res.status(404).json({ message: 'Role not found' });
     const roleName = oldResult[0].name;
@@ -562,8 +715,8 @@ app.delete('/staff-roles/:id', verifyAdmin, (req, res) => {
   });
 });
 
-// PUT /staff-roles/reorder — bulk update sorting of categories (admin only)
-app.put('/staff-roles/reorder', verifyAdmin, (req, res) => {
+// PUT /staff-roles/reorder — bulk update sorting of categories (admin only with permission)
+app.put('/staff-roles/reorder', verifyPermission('staff'), (req, res) => {
   const { orders } = req.body;
   if (!Array.isArray(orders)) return res.status(400).json({ message: 'Invalid data' });
 
@@ -586,8 +739,8 @@ app.put('/staff-roles/reorder', verifyAdmin, (req, res) => {
   });
 });
 
-// PUT /staff-roles/:id — edit department name/color/icon (admin only)
-app.put('/staff-roles/:id', verifyAdmin, (req, res) => {
+// PUT /staff-roles/:id — edit department name/color/icon (admin only with permission)
+app.put('/staff-roles/:id', verifyPermission('staff'), (req, res) => {
   const { name, color, icon_name } = req.body;
   if (!name) return res.status(400).json({ message: 'Role Name is required' });
 
@@ -621,6 +774,16 @@ db.query("SHOW COLUMNS FROM roster_members LIKE 'color'", (err, results) => {
     db.query("ALTER TABLE roster_members ADD COLUMN color VARCHAR(50) DEFAULT NULL", (err2) => {
       if (err2) console.error("Error adding color column to roster_members:", err2);
       else console.log("Added color column to roster_members table.");
+    });
+  }
+});
+
+// Auto-add name_color column to roster_members table if missing
+db.query("SHOW COLUMNS FROM roster_members LIKE 'name_color'", (err, results) => {
+  if (!err && (!results || results.length === 0)) {
+    db.query("ALTER TABLE roster_members ADD COLUMN name_color VARCHAR(50) DEFAULT NULL", (err2) => {
+      if (err2) console.error("Error adding name_color column to roster_members:", err2);
+      else console.log("Added name_color column to roster_members table.");
     });
   }
 });
@@ -659,19 +822,19 @@ app.get('/roster', (req, res) => {
   });
 });
 
-// POST /roster — admin only, add new member
-app.post('/roster', verifyAdmin, (req, res) => {
-  const { section, title, name, description, section_order, sort_order, color } = req.body;
+// POST /roster — admin only with permission, add new member
+app.post('/roster', verifyPermission('roster'), (req, res) => {
+  const { section, title, name, description, section_order, sort_order, color, name_color } = req.body;
   if (!section || !title) return res.status(400).json({ message: 'section and title are required' });
-  const sql = "INSERT INTO roster_members (section, title, name, description, section_order, sort_order, color) VALUES (?, ?, ?, ?, ?, ?, ?)";
-  db.query(sql, [section, title, name || 'Vacant', description || '', section_order || 0, sort_order || 0, color || null], (err, result) => {
+  const sql = "INSERT INTO roster_members (section, title, name, description, section_order, sort_order, color, name_color) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+  db.query(sql, [section, title, name || 'Vacant', description || '', section_order || 0, sort_order || 0, color || null, name_color || null], (err, result) => {
     if (err) return res.status(500).json({ message: 'Failed to add roster member', error: err });
     res.json({ message: 'Member added', id: result.insertId });
   });
 });
 
-// PUT /roster/reorder — admin only, bulk update sort_order
-app.put('/roster/reorder', verifyAdmin, (req, res) => {
+// PUT /roster/reorder — admin only with permission, bulk update sort_order
+app.put('/roster/reorder', verifyPermission('roster'), (req, res) => {
   const { orders } = req.body;
   if (!Array.isArray(orders) || orders.length === 0)
     return res.json({ message: 'Nothing to reorder' });
@@ -692,18 +855,18 @@ app.put('/roster/reorder', verifyAdmin, (req, res) => {
   });
 });
 
-// PUT /roster/:id — admin only, update a member
-app.put('/roster/:id', verifyAdmin, (req, res) => {
-  const { section, title, name, description, section_order, sort_order, color } = req.body;
-  const sql = "UPDATE roster_members SET section=?, title=?, name=?, description=?, section_order=?, sort_order=?, color=? WHERE id=?";
-  db.query(sql, [section, title, name || 'Vacant', description || '', section_order || 0, sort_order || 0, color || null, req.params.id], (err) => {
+// PUT /roster/:id — admin only with permission, update a member
+app.put('/roster/:id', verifyPermission('roster'), (req, res) => {
+  const { section, title, name, description, section_order, sort_order, color, name_color } = req.body;
+  const sql = "UPDATE roster_members SET section=?, title=?, name=?, description=?, section_order=?, sort_order=?, color=?, name_color=? WHERE id=?";
+  db.query(sql, [section, title, name || 'Vacant', description || '', section_order || 0, sort_order || 0, color || null, name_color || null, req.params.id], (err) => {
     if (err) return res.status(500).json({ message: 'Failed to update member', error: err });
     res.json({ message: 'Member updated' });
   });
 });
 
-// DELETE /roster/:id — admin only
-app.delete('/roster/:id', verifyAdmin, (req, res) => {
+// DELETE /roster/:id — admin only with permission
+app.delete('/roster/:id', verifyPermission('roster'), (req, res) => {
   db.query("DELETE FROM roster_members WHERE id = ?", [req.params.id], (err) => {
     if (err) return res.status(500).json({ message: 'Failed to delete member', error: err });
     res.json({ message: 'Member deleted' });
@@ -790,8 +953,8 @@ app.get('/roster/sections', (req, res) => {
   });
 });
 
-// POST /roster/sections — admin only
-app.post('/roster/sections', verifyAdmin, (req, res) => {
+// POST /roster/sections — admin only with permission
+app.post('/roster/sections', verifyPermission('roster'), (req, res) => {
   const { name, sort_order, color, icon } = req.body;
   if (!name) return res.status(400).json({ message: 'Section name is required' });
   const sql = "INSERT INTO roster_sections (name, sort_order, color, icon) VALUES (?, ?, ?, ?)";
@@ -806,8 +969,8 @@ app.post('/roster/sections', verifyAdmin, (req, res) => {
   });
 });
 
-// PUT /roster/sections/reorder — admin only
-app.put('/roster/sections/reorder', verifyAdmin, (req, res) => {
+// PUT /roster/sections/reorder — admin only with permission
+app.put('/roster/sections/reorder', verifyPermission('roster'), (req, res) => {
   const { orders } = req.body;
   console.log("Roster sections reorder request received. Orders payload:", orders);
   
@@ -850,8 +1013,8 @@ app.put('/roster/sections/reorder', verifyAdmin, (req, res) => {
   });
 });
 
-// PUT /roster/sections/:id — admin only
-app.put('/roster/sections/:id', verifyAdmin, (req, res) => {
+// PUT /roster/sections/:id — admin only with permission
+app.put('/roster/sections/:id', verifyPermission('roster'), (req, res) => {
   const { name, sort_order, color, icon } = req.body;
   if (!name) return res.status(400).json({ message: 'Section name is required' });
 
@@ -870,8 +1033,8 @@ app.put('/roster/sections/:id', verifyAdmin, (req, res) => {
   });
 });
 
-// DELETE /roster/sections/:id — admin only
-app.delete('/roster/sections/:id', verifyAdmin, (req, res) => {
+// DELETE /roster/sections/:id — admin only with permission
+app.delete('/roster/sections/:id', verifyPermission('roster'), (req, res) => {
   db.query("SELECT name FROM roster_sections WHERE id = ?", [req.params.id], (err, results) => {
     if (err || results.length === 0) return res.status(404).json({ message: 'Section not found' });
     const sectionName = results[0].name;
@@ -1031,8 +1194,8 @@ app.get('/roster/chain-of-command', (req, res) => {
   });
 });
 
-// PUT /roster/chain-of-command — admin only
-app.put('/roster/chain-of-command', verifyAdmin, (req, res) => {
+// PUT /roster/chain-of-command — admin only with permission
+app.put('/roster/chain-of-command', verifyPermission('roster'), (req, res) => {
   const { content } = req.body;
   if (!content) return res.status(400).json({ message: 'Content is required' });
 
@@ -1044,6 +1207,681 @@ app.put('/roster/chain-of-command', verifyAdmin, (req, res) => {
   db.query(sql, [content, content], (err) => {
     if (err) return res.status(500).json({ message: 'Failed to save chain of command data', error: err });
     res.json({ message: 'Chain of command updated successfully' });
+  });
+});
+
+
+// ════════════ HELPER ROSTER API ════════════
+
+// Auto-create helper_roster_members table
+db.query(`
+  CREATE TABLE IF NOT EXISTS helper_roster_members (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    section VARCHAR(100) NOT NULL,
+    section_order INT DEFAULT 0,
+    title VARCHAR(255) NOT NULL,
+    name VARCHAR(255) DEFAULT 'Vacant',
+    description TEXT,
+    sort_order INT DEFAULT 0,
+    color VARCHAR(50) DEFAULT NULL,
+    country VARCHAR(10) DEFAULT '',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  )
+`, (err) => { if (err) console.error('Error creating helper_roster_members:', err); });
+
+// Auto-add country column to helper_roster_members table if missing
+db.query("SHOW COLUMNS FROM helper_roster_members LIKE 'country'", (err, results) => {
+  if (!err && (!results || results.length === 0)) {
+    db.query("ALTER TABLE helper_roster_members ADD COLUMN country VARCHAR(10) DEFAULT ''", (err2) => {
+      if (err2) console.error("Error adding country column to helper_roster_members:", err2);
+      else console.log("Added country column to helper_roster_members table.");
+    });
+  }
+});
+
+// Auto-add name_color column to helper_roster_members table if missing
+db.query("SHOW COLUMNS FROM helper_roster_members LIKE 'name_color'", (err, results) => {
+  if (!err && (!results || results.length === 0)) {
+    db.query("ALTER TABLE helper_roster_members ADD COLUMN name_color VARCHAR(50) DEFAULT NULL", (err2) => {
+      if (err2) console.error("Error adding name_color column to helper_roster_members:", err2);
+      else console.log("Added name_color column to helper_roster_members table.");
+    });
+  }
+});
+
+// Auto-create helper_roster_sections table
+db.query(`
+  CREATE TABLE IF NOT EXISTS helper_roster_sections (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL UNIQUE,
+    sort_order INT DEFAULT 0,
+    color VARCHAR(50) DEFAULT NULL,
+    icon VARCHAR(50) DEFAULT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  )
+`, (err) => { if (err) console.error('Error creating helper_roster_sections:', err); });
+
+// GET /helper-roster — public
+app.get('/helper-roster', (req, res) => {
+  const sql = `
+    SELECT m.*, s.color AS section_color, s.icon AS section_icon
+    FROM helper_roster_members m
+    LEFT JOIN helper_roster_sections s ON m.section = s.name
+    ORDER BY m.section_order ASC, m.sort_order ASC
+  `;
+  db.query(sql, (err, results) => {
+    if (err) return res.status(500).json({ message: 'DB error', error: err });
+    res.json(results);
+  });
+});
+
+// POST /helper-roster — admin only with permission
+app.post('/helper-roster', verifyPermission('helper-roster'), (req, res) => {
+  const { section, title, name, description, section_order, sort_order, color, country, name_color } = req.body;
+  if (!section || !title) return res.status(400).json({ message: 'section and title are required' });
+  const sql = "INSERT INTO helper_roster_members (section, title, name, description, section_order, sort_order, color, country, name_color) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+  db.query(sql, [section, title, name || 'Vacant', description || '', section_order || 0, sort_order || 0, color || null, country || '', name_color || null], (err, result) => {
+    if (err) return res.status(500).json({ message: 'Failed to add helper roster member', error: err });
+    res.json({ message: 'Member added', id: result.insertId });
+  });
+});
+
+// PUT /helper-roster/reorder — admin only with permission
+app.put('/helper-roster/reorder', verifyPermission('helper-roster'), (req, res) => {
+  const { orders } = req.body;
+  if (!Array.isArray(orders) || orders.length === 0)
+    return res.json({ message: 'Nothing to reorder' });
+
+  let completed = 0;
+  let hasError = false;
+  orders.forEach(item => {
+    db.query("UPDATE helper_roster_members SET sort_order = ? WHERE id = ?", [item.sort_order, item.id], (err) => {
+      if (err && !hasError) {
+        hasError = true;
+        return res.status(500).json({ message: 'Reorder failed', error: err });
+      }
+      completed++;
+      if (completed === orders.length && !hasError) {
+        res.json({ message: 'Helper roster order updated' });
+      }
+    });
+  });
+});
+
+// PUT /helper-roster/:id — admin only with permission
+app.put('/helper-roster/:id', verifyPermission('helper-roster'), (req, res) => {
+  const { section, title, name, description, section_order, sort_order, color, country, name_color } = req.body;
+  const sql = "UPDATE helper_roster_members SET section=?, title=?, name=?, description=?, section_order=?, sort_order=?, color=?, country=?, name_color=? WHERE id=?";
+  db.query(sql, [section, title, name || 'Vacant', description || '', section_order || 0, sort_order || 0, color || null, country || '', name_color || null, req.params.id], (err) => {
+    if (err) return res.status(500).json({ message: 'Failed to update member', error: err });
+    res.json({ message: 'Member updated' });
+  });
+});
+
+// DELETE /helper-roster/:id — admin only with permission
+app.delete('/helper-roster/:id', verifyPermission('helper-roster'), (req, res) => {
+  db.query("DELETE FROM helper_roster_members WHERE id = ?", [req.params.id], (err) => {
+    if (err) return res.status(500).json({ message: 'Failed to delete member', error: err });
+    res.json({ message: 'Member deleted' });
+  });
+});
+
+// GET /helper-roster/sections — public
+app.get('/helper-roster/sections', (req, res) => {
+  db.query("SELECT * FROM helper_roster_sections ORDER BY sort_order ASC", (err, results) => {
+    if (err) return res.status(500).json({ message: 'DB error', error: err });
+    res.json(results || []);
+  });
+});
+
+// POST /helper-roster/sections — admin only with permission
+app.post('/helper-roster/sections', verifyPermission('helper-roster'), (req, res) => {
+  const { name, sort_order, color, icon } = req.body;
+  if (!name) return res.status(400).json({ message: 'Section name is required' });
+  const sql = "INSERT INTO helper_roster_sections (name, sort_order, color, icon) VALUES (?, ?, ?, ?)";
+  db.query(sql, [name, sort_order || 0, color || null, icon || null], (err, result) => {
+    if (err) {
+      if (err.code === 'ER_DUP_ENTRY') return res.status(400).json({ message: 'Section name already exists' });
+      return res.status(500).json({ message: 'Failed to create section', error: err });
+    }
+    res.json({ message: 'Section created', id: result.insertId });
+  });
+});
+
+// PUT /helper-roster/sections/reorder — admin only with permission
+app.put('/helper-roster/sections/reorder', verifyPermission('helper-roster'), (req, res) => {
+  const { orders } = req.body;
+  if (!Array.isArray(orders) || orders.length === 0)
+    return res.json({ message: 'Nothing to reorder' });
+
+  let completed = 0;
+  let hasError = false;
+  orders.forEach(item => {
+    db.query("UPDATE helper_roster_sections SET sort_order = ? WHERE id = ?", [item.sort_order, item.id], (err) => {
+      if (err && !hasError) {
+        hasError = true;
+        return res.status(500).json({ message: 'Reorder failed', error: err.message });
+      }
+      if (!hasError) {
+        completed++;
+        if (completed === orders.length) {
+          // Cascade section_order to members
+          db.query("SELECT id, name, sort_order FROM helper_roster_sections", (err2, sections) => {
+            if (!err2 && sections) {
+              sections.forEach(sec => {
+                db.query("UPDATE helper_roster_members SET section_order = ? WHERE section = ?", [sec.sort_order, sec.name]);
+              });
+            }
+          });
+          res.json({ message: 'Sections reorder completed' });
+        }
+      }
+    });
+  });
+});
+
+// PUT /helper-roster/sections/:id — admin only with permission
+app.put('/helper-roster/sections/:id', verifyPermission('helper-roster'), (req, res) => {
+  const { name, sort_order, color, icon } = req.body;
+  if (!name) return res.status(400).json({ message: 'Section name is required' });
+
+  db.query("SELECT name FROM helper_roster_sections WHERE id = ?", [req.params.id], (err, results) => {
+    if (err || results.length === 0) return res.status(404).json({ message: 'Section not found' });
+    const oldName = results[0].name;
+
+    db.query("UPDATE helper_roster_sections SET name = ?, sort_order = ?, color = ?, icon = ? WHERE id = ?",
+      [name, sort_order || 0, color || null, icon || null, req.params.id], (err2) => {
+        if (err2) return res.status(500).json({ message: 'Failed to update section', error: err2 });
+        // Cascade name + order updates to existing members
+        db.query("UPDATE helper_roster_members SET section = ?, section_order = ? WHERE section = ?",
+          [name, sort_order || 0, oldName], () => {
+            res.json({ message: 'Section updated successfully' });
+          });
+      });
+  });
+});
+
+// DELETE /helper-roster/sections/:id — admin only with permission
+app.delete('/helper-roster/sections/:id', verifyPermission('helper-roster'), (req, res) => {
+  db.query("SELECT name FROM helper_roster_sections WHERE id = ?", [req.params.id], (err, results) => {
+    if (err || results.length === 0) return res.status(404).json({ message: 'Section not found' });
+    const sectionName = results[0].name;
+    db.query("DELETE FROM helper_roster_sections WHERE id = ?", [req.params.id], (err2) => {
+      if (err2) return res.status(500).json({ message: 'Failed to delete section', error: err2 });
+      db.query("DELETE FROM helper_roster_members WHERE section = ?", [sectionName], () => {
+        res.json({ message: 'Section and its members deleted' });
+      });
+    });
+  });
+});
+
+
+// ════════════ FAQ API ════════════
+
+// Auto-create faqs table if missing and seed defaults
+db.query(`
+  CREATE TABLE IF NOT EXISTS faqs (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    question TEXT NOT NULL,
+    answer TEXT NOT NULL,
+    sort_order INT DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  )
+`, (err) => {
+  if (err) {
+    console.error('Error creating faqs table:', err);
+  } else {
+    db.query("SELECT COUNT(*) as count FROM faqs", (errCount, results) => {
+      if (!errCount && results && results[0].count === 0) {
+        const defaultFaqs = [
+          [
+            "When is Paraiso Gaming launching?",
+            "Paraiso Gaming is expected to launch within the next 2–3 weeks. Our team is currently completing final testing and polishing every system to deliver the best possible experience at launch. Be sure to join our Discord and Forums to stay up to date with announcements, development updates, giveaways, and the official launch date.",
+            0
+          ],
+          [
+            "Can I transfer my stats if I come from Horizon Roleplay?",
+            "Yes. We are honoring many Horizon Roleplay players. Eligible players may qualify for equivalent statistics, faction ranks, leadership positions, and exclusive rewards. Every transfer request is reviewed individually by our management team.",
+            1
+          ],
+          [
+            "How do I get started on Paraiso Gaming?",
+            "Simply create your character and begin your journey. Whether you want to join law enforcement, emergency services, become a business owner, criminal, lawyer, journalist, or simply live as a civilian, Paraiso Gaming offers countless opportunities to create your own story.",
+            2
+          ],
+          [
+            "Is Paraiso Gaming beginner-friendly?",
+            "Absolutely. Whether you’re new to SA-MP roleplay or a longtime veteran, our staff and community are here to help. We provide guides, tutorials, and active support to ensure every player has an enjoyable experience from day one.",
+            3
+          ],
+          [
+            "What makes Paraiso Gaming different?",
+            "Paraiso Gaming is built around immersive roleplay, fair administration, balanced gameplay, and a player-first philosophy. Our goal is to create a long-lasting community where your decisions, achievements, and roleplay truly matter.",
+            4
+          ]
+        ];
+
+        let seeded = 0;
+        defaultFaqs.forEach((faq) => {
+          db.query("INSERT INTO faqs (question, answer, sort_order) VALUES (?, ?, ?)", faq, (errInsert) => {
+            if (!errInsert) seeded++;
+            if (seeded === defaultFaqs.length) {
+              console.log("Successfully seeded default FAQs in DB.");
+            }
+          });
+        });
+      }
+    });
+  }
+});
+
+// GET /faqs — public
+app.get('/faqs', (req, res) => {
+  db.query("SELECT * FROM faqs ORDER BY sort_order ASC, id ASC", (err, results) => {
+    if (err) return res.status(500).json({ message: 'Failed to fetch FAQs' });
+    res.json(results);
+  });
+});
+
+// POST /faqs — admin only with permission
+app.post('/faqs', verifyPermission('faqs'), (req, res) => {
+  const { question, answer } = req.body;
+  if (!question || !answer) return res.status(400).json({ message: 'Question and Answer are required' });
+
+  db.query("SELECT MAX(sort_order) as maxOrder FROM faqs", (err, orderResult) => {
+    const nextOrder = (orderResult && orderResult[0]?.maxOrder !== null) ? orderResult[0].maxOrder + 1 : 0;
+
+    db.query(
+      "INSERT INTO faqs (question, answer, sort_order) VALUES (?, ?, ?)",
+      [question, answer, nextOrder],
+      (err, result) => {
+        if (err) return res.status(500).json({ message: 'Failed to create FAQ: ' + err.message });
+        res.status(201).json({ id: result.insertId, question, answer, sort_order: nextOrder });
+      }
+    );
+  });
+});
+
+// PUT /faqs/reorder — admin only with permission
+app.put('/faqs/reorder', verifyPermission('faqs'), (req, res) => {
+  const { orders } = req.body;
+  if (!Array.isArray(orders) || orders.length === 0)
+    return res.json({ message: 'Nothing to reorder' });
+
+  let completed = 0;
+  let hasError = false;
+  orders.forEach(item => {
+    db.query("UPDATE faqs SET sort_order = ? WHERE id = ?", [item.sort_order, item.id], (err) => {
+      if (err && !hasError) {
+        hasError = true;
+        return res.status(500).json({ message: 'Reorder failed', error: err.message });
+      }
+      completed++;
+      if (completed === orders.length && !hasError) {
+        res.json({ message: 'FAQs reordered successfully' });
+      }
+    });
+  });
+});
+
+// PUT /faqs/:id — admin only with permission
+app.put('/faqs/:id', verifyPermission('faqs'), (req, res) => {
+  const { question, answer } = req.body;
+  if (!question || !answer) return res.status(400).json({ message: 'Question and Answer are required' });
+
+  db.query("UPDATE faqs SET question = ?, answer = ? WHERE id = ?", [question, answer, req.params.id], (err, result) => {
+    if (err) return res.status(500).json({ message: 'Failed to update FAQ: ' + err.message });
+    res.json({ message: 'FAQ updated successfully' });
+  });
+});
+
+// DELETE /faqs/:id — admin only with permission
+app.delete('/faqs/:id', verifyPermission('faqs'), (req, res) => {
+  db.query("DELETE FROM faqs WHERE id = ?", [req.params.id], (err) => {
+    if (err) return res.status(500).json({ message: 'Failed to delete FAQ' });
+    res.json({ message: 'FAQ deleted' });
+  });
+});
+
+
+// ════════════ CHAIN OF COMMAND API ════════════
+
+// Drop old chain_of_command table if it contains the obsolete 'category' column to migrate gracefully
+db.query("SHOW COLUMNS FROM chain_of_command LIKE 'category'", (err, columns) => {
+  if (!err && columns && columns.length > 0) {
+    console.log("Migrating chain_of_command to new schema (dropping old table first)...");
+    db.query("DROP TABLE IF EXISTS chain_of_command", (errDrop) => {
+      if (errDrop) console.error("Failed to drop old table:", errDrop);
+      initializeCoCTables();
+    });
+  } else {
+    initializeCoCTables();
+  }
+});
+
+function initializeCoCTables() {
+  db.query(`
+    CREATE TABLE IF NOT EXISTS coc_categories (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      name VARCHAR(255) NOT NULL UNIQUE,
+      sort_order INT DEFAULT 0
+    )
+  `, (errCat) => {
+    if (errCat) {
+      console.error('Error creating coc_categories table:', errCat);
+      return;
+    }
+
+    db.query(`
+      CREATE TABLE IF NOT EXISTS chain_of_command (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        category_id INT NOT NULL,
+        layout VARCHAR(50) DEFAULT 'detailed', -- 'simple' or 'detailed'
+        title VARCHAR(255) NOT NULL,
+        subtitle VARCHAR(255) DEFAULT NULL,
+        description TEXT DEFAULT NULL,
+        reports TEXT DEFAULT NULL, -- JSON string representing array of group objects
+        footer TEXT DEFAULT NULL,
+        color VARCHAR(50) DEFAULT '#22d3ee',
+        sort_order INT DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (category_id) REFERENCES coc_categories(id) ON DELETE CASCADE
+      )
+    `, (errCoc) => {
+      if (errCoc) {
+        console.error('Error creating chain_of_command table:', errCoc);
+        return;
+      }
+      seedCoC();
+    });
+  });
+}
+
+function seedCoC() {
+  db.query("SELECT COUNT(*) as count FROM coc_categories", (err, catResults) => {
+    if (!err && catResults && catResults[0].count === 0) {
+      db.query("INSERT INTO coc_categories (id, name, sort_order) VALUES (1, 'Executive Leadership', 0), (2, 'Executive Departments', 1)", (errSeedCat) => {
+        if (errSeedCat) {
+          console.error("Failed to seed categories:", errSeedCat);
+          return;
+        }
+        console.log("Seeded default Chain of Command categories.");
+        seedCards();
+      });
+    } else {
+      seedCards();
+    }
+  });
+}
+
+function seedCards() {
+  db.query("SELECT COUNT(*) as count FROM chain_of_command", (err, cardsResults) => {
+    if (!err && cardsResults && cardsResults[0].count === 0) {
+      const defaultCoC = [
+        [
+          1,
+          'simple',
+          'President',
+          null,
+          'The highest-ranking official within the Government of Paraiso. The President sets the overall vision of the community and has final authority over major decisions, appointments, and policies.',
+          null,
+          null,
+          '#c9a84c',
+          0
+        ],
+        [
+          1,
+          'simple',
+          'Vice President',
+          null,
+          'The second-highest executive official. The Vice President assists the President with government operations and acts on behalf of the President when necessary.',
+          null,
+          null,
+          '#94a3b8',
+          1
+        ],
+        [
+          2,
+          'detailed',
+          'Secretary of Defense',
+          'Oversees all law enforcement and emergency service departments.',
+          null,
+          JSON.stringify([
+            {
+              "group_title": "Admin Personnel",
+              "items": ["Helper Management"]
+            },
+            {
+              "group_title": "Faction Management",
+              "items": ["Paraiso Police Department", "Federal Bureau of Investigation", "Paraiso Fire & Medical Department", "National Guard", "San Andreas News"]
+            }
+          ]),
+          'Admin Personnel assists the Secretary of Defense in keeping Government employees on the right track. This includes professionalism, honor & loyalty. Aswel as issuing any punishments if any Government employees break the rules and or laws. Faction Management assists faction leaders, monitors activity, reviews department performance, and reports directly to the Secretary of Defense.',
+          '#22d3ee',
+          0
+        ],
+        [
+          2,
+          'detailed',
+          'Secretary of State',
+          'Oversees all civilian and criminal organizations operating throughout Paraiso.',
+          null,
+          JSON.stringify([
+            {
+              "group_title": "Gang Management",
+              "items": ["All Official Criminal Organizations"]
+            },
+            {
+              "group_title": "Civilian Management",
+              "items": ["Paraiso News", "Taxi Services", "Future Civilian Organizations"]
+            }
+          ]),
+          'Gang Management works with gang leaders, their applications, and reports directly to the Secretary of State.',
+          '#22d3ee',
+          1
+        ],
+        [
+          2,
+          'detailed',
+          'Governor of Economic & Development',
+          'Oversees the economic development of Paraiso, including businesses, commercial enterprises, and economic affairs.',
+          null,
+          JSON.stringify([
+            {
+              "group_title": "Business Management",
+              "items": ["Business Applications", "Ownership Transfers", "Commercial Disputes", "Business Owner Support"]
+            }
+          ]),
+          'Business Management handles the daily business process while the Governor oversees the overall economy and commercial growth of Paraiso.',
+          '#22d3ee',
+          2
+        ],
+        [
+          2,
+          'detailed',
+          'Governor of City Relations',
+          'Oversees the City relations of Paraiso, including complaints, appeals, and city helper organisations.',
+          null,
+          JSON.stringify([
+            {
+              "group_title": "Community Management",
+              "items": ["Ban Appeals", "Warning Appeals", "Complaints"]
+            },
+            {
+              "group_title": "Helper Management",
+              "items": ["Helper Applications", "Helper Complaints"]
+            }
+          ]),
+          'Community Management handles the daily community issues and appeals. Helper Management handles the daily tasks and management of all Helper employees, while the Governor oversees the overall relations between the Government & Citizens.',
+          '#22d3ee',
+          3
+        ]
+      ];
+
+      let seeded = 0;
+      defaultCoC.forEach((item) => {
+        db.query(
+          "INSERT INTO chain_of_command (category_id, layout, title, subtitle, description, reports, footer, color, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          item,
+          (errInsert) => {
+            if (!errInsert) seeded++;
+            if (seeded === defaultCoC.length) {
+              console.log("Successfully seeded default Chain of Command cards.");
+            }
+          }
+        );
+      });
+    }
+  });
+}
+
+// GET /chain-of-command/categories
+app.get('/chain-of-command/categories', (req, res) => {
+  db.query("SELECT * FROM coc_categories ORDER BY sort_order ASC, id ASC", (err, results) => {
+    if (err) return res.status(500).json({ message: 'Failed to fetch categories' });
+    res.json(results);
+  });
+});
+
+// POST /chain-of-command/categories
+app.post('/chain-of-command/categories', verifyPermission('coc'), (req, res) => {
+  const { name } = req.body;
+  if (!name || !name.trim()) return res.status(400).json({ message: 'Category name is required' });
+
+  db.query("SELECT MAX(sort_order) as maxOrder FROM coc_categories", (err, orderResult) => {
+    const nextOrder = (orderResult && orderResult[0]?.maxOrder !== null) ? orderResult[0].maxOrder + 1 : 0;
+    db.query("INSERT INTO coc_categories (name, sort_order) VALUES (?, ?)", [name.trim(), nextOrder], (errInsert, result) => {
+      if (errInsert) {
+        if (errInsert.code === 'ER_DUP_ENTRY') {
+          return res.status(400).json({ message: 'A category with this name already exists' });
+        }
+        return res.status(500).json({ message: 'Failed to create category: ' + errInsert.message });
+      }
+      res.status(201).json({ id: result.insertId, name: name.trim(), sort_order: nextOrder });
+    });
+  });
+});
+
+// PUT /chain-of-command/categories/reorder
+app.put('/chain-of-command/categories/reorder', verifyPermission('coc'), (req, res) => {
+  const { orders } = req.body;
+  if (!Array.isArray(orders) || orders.length === 0)
+    return res.json({ message: 'Nothing to reorder' });
+
+  let completed = 0;
+  let hasError = false;
+  orders.forEach(item => {
+    db.query("UPDATE coc_categories SET sort_order = ? WHERE id = ?", [item.sort_order, item.id], (err) => {
+      if (err && !hasError) {
+        hasError = true;
+        return res.status(500).json({ message: 'Reorder failed', error: err.message });
+      }
+      completed++;
+      if (completed === orders.length && !hasError) {
+        res.json({ message: 'Categories reordered successfully' });
+      }
+    });
+  });
+});
+
+// PUT /chain-of-command/categories/:id
+app.put('/chain-of-command/categories/:id', verifyPermission('coc'), (req, res) => {
+  const { name } = req.body;
+  if (!name || !name.trim()) return res.status(400).json({ message: 'Category name is required' });
+
+  db.query("UPDATE coc_categories SET name = ? WHERE id = ?", [name.trim(), req.params.id], (err) => {
+    if (err) {
+      if (err.code === 'ER_DUP_ENTRY') {
+        return res.status(400).json({ message: 'A category with this name already exists' });
+      }
+      return res.status(500).json({ message: 'Failed to update category: ' + err.message });
+    }
+    res.json({ message: 'Category renamed successfully' });
+  });
+});
+
+// DELETE /chain-of-command/categories/:id
+app.delete('/chain-of-command/categories/:id', verifyPermission('coc'), (req, res) => {
+  db.query("DELETE FROM coc_categories WHERE id = ?", [req.params.id], (err) => {
+    if (err) return res.status(500).json({ message: 'Failed to delete category: ' + err.message });
+    res.json({ message: 'Category and all associated cards deleted' });
+  });
+});
+
+// GET /chain-of-command — public (joined with category name)
+app.get('/chain-of-command', (req, res) => {
+  db.query(`
+    SELECT coc.*, cat.name as category_name, cat.sort_order as cat_sort_order
+    FROM chain_of_command coc
+    JOIN coc_categories cat ON coc.category_id = cat.id
+    ORDER BY cat.sort_order ASC, cat.id ASC, coc.sort_order ASC, coc.id ASC
+  `, (err, results) => {
+    if (err) return res.status(500).json({ message: 'Failed to fetch Chain of Command entries' });
+    res.json(results);
+  });
+});
+
+// POST /chain-of-command — admin only with permission
+app.post('/chain-of-command', verifyPermission('coc'), (req, res) => {
+  const { category_id, layout, title, subtitle, description, reports, footer, color } = req.body;
+  if (!category_id || !title) return res.status(400).json({ message: 'Category and Title are required' });
+
+  db.query("SELECT MAX(sort_order) as maxOrder FROM chain_of_command WHERE category_id = ?", [category_id], (err, orderResult) => {
+    const nextOrder = (orderResult && orderResult[0]?.maxOrder !== null) ? orderResult[0].maxOrder + 1 : 0;
+
+    db.query(
+      "INSERT INTO chain_of_command (category_id, layout, title, subtitle, description, reports, footer, color, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      [category_id, layout || 'detailed', title, subtitle, description, reports ? JSON.stringify(reports) : null, footer, color || '#22d3ee', nextOrder],
+      (errInsert, result) => {
+        if (errInsert) return res.status(500).json({ message: 'Failed to create CoC entry: ' + errInsert.message });
+        res.status(201).json({ id: result.insertId, category_id, layout, title, subtitle, description, reports, footer, color, sort_order: nextOrder });
+      }
+    );
+  });
+});
+
+// PUT /chain-of-command/reorder — admin only with permission
+app.put('/chain-of-command/reorder', verifyPermission('coc'), (req, res) => {
+  const { orders } = req.body;
+  if (!Array.isArray(orders) || orders.length === 0)
+    return res.json({ message: 'Nothing to reorder' });
+
+  let completed = 0;
+  let hasError = false;
+  orders.forEach(item => {
+    db.query("UPDATE chain_of_command SET sort_order = ? WHERE id = ?", [item.sort_order, item.id], (err) => {
+      if (err && !hasError) {
+        hasError = true;
+        return res.status(500).json({ message: 'Reorder failed', error: err.message });
+      }
+      completed++;
+      if (completed === orders.length && !hasError) {
+        res.json({ message: 'Chain of Command entries reordered successfully' });
+      }
+    });
+  });
+});
+
+// PUT /chain-of-command/:id — admin only with permission
+app.put('/chain-of-command/:id', verifyPermission('coc'), (req, res) => {
+  const { category_id, layout, title, subtitle, description, reports, footer, color } = req.body;
+  if (!category_id || !title) return res.status(400).json({ message: 'Category and Title are required' });
+
+  db.query(
+    "UPDATE chain_of_command SET category_id = ?, layout = ?, title = ?, subtitle = ?, description = ?, reports = ?, footer = ?, color = ? WHERE id = ?",
+    [category_id, layout, title, subtitle, description, reports ? JSON.stringify(reports) : null, footer, color, req.params.id],
+    (err, result) => {
+      if (err) return res.status(500).json({ message: 'Failed to update CoC entry: ' + err.message });
+      res.json({ message: 'Chain of Command entry updated successfully' });
+    }
+  );
+});
+
+// DELETE /chain-of-command/:id — admin only with permission
+app.delete('/chain-of-command/:id', verifyPermission('coc'), (req, res) => {
+  db.query("DELETE FROM chain_of_command WHERE id = ?", [req.params.id], (err) => {
+    if (err) return res.status(500).json({ message: 'Failed to delete CoC entry' });
+    res.json({ message: 'Chain of Command entry deleted' });
   });
 });
 
