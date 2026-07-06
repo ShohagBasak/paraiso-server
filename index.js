@@ -74,7 +74,11 @@ db.query(`
 
 // ─── verifyToken Middleware ────────────────────────────────
 function verifyToken(req, res, next) {
-  const token = req.cookies.token;
+  let token = req.cookies.token;
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    token = authHeader.split(' ')[1];
+  }
   if (!token) return res.status(401).json({ message: 'Not authenticated' });
   try {
     req.user = jwt.verify(token, process.env.JWT_SECRET);
@@ -191,6 +195,7 @@ app.post('/register', async (req, res) => {
       console.log("User registered successfully:", email);
 
       res.status(201).json({
+        token,
         user: {
           id: result.insertId,
           username,
@@ -224,7 +229,10 @@ app.post('/login', (req, res) => {
     
     db.query("SELECT permission_key FROM admin_permissions WHERE user_id = ?", [id], (err2, permResults) => {
       const permissions = !err2 && permResults ? permResults.map(p => p.permission_key) : [];
-      res.json({ user: { id, username, email, role, permissions } });
+      res.json({ 
+        token,
+        user: { id, username, email, role, permissions } 
+      });
     });
   });
 });
