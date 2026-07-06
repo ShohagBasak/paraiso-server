@@ -2,6 +2,8 @@ const express = require('express');
 const db = require('./db');
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
+const fs = require('fs');
+const path = require('path');
 require('dotenv').config();
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
@@ -26,8 +28,9 @@ const cookieOptions = {
   maxAge: 7 * 24 * 60 * 60 * 1000
 };
 
-app.use(express.json());
+app.use(express.json({ limit: '10mb' })); // increase size limit for base64 uploads
 app.use(cookieParser());
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // ─── Initialize Permissions Table & Auto-promote Master Admin ───
 db.query(`
@@ -353,7 +356,7 @@ app.put('/banners/:id', verifyPermission('banners'), (req, res) => {
 
 // GET /users — all users (master admin only)
 app.get('/users', verifyMaster, (req, res) => {
-  db.query("SELECT id, username, email, role FROM users ORDER BY id DESC", (err, results) => {
+  db.query("SELECT id, username, email, role FROM users ORDER BY id ASC", (err, results) => {
     if (err) {
       console.error(err);
       return res.status(500).json({ message: 'Database error: ' + err.message });
@@ -417,6 +420,28 @@ app.put('/users/:id/permissions', verifyMaster, (req, res) => {
       if (err2) return res.status(500).json({ message: 'Failed to save permissions' });
       res.json({ message: 'Permissions updated successfully' });
     });
+  });
+});
+
+// DELETE /users/bulk — delete multiple users (master admin only)
+app.delete('/users/bulk', verifyMaster, (req, res) => {
+  const { userIds } = req.body;
+  if (!Array.isArray(userIds) || userIds.length === 0) {
+    return res.status(400).json({ message: 'User IDs are required' });
+  }
+
+  // Filter out the current admin's ID to prevent self-deletion
+  const targetIds = userIds.map(id => parseInt(id)).filter(id => id !== parseInt(req.user.id));
+  if (targetIds.length === 0) {
+    return res.status(400).json({ message: 'No valid user accounts to delete.' });
+  }
+
+  db.query("DELETE FROM users WHERE id IN (?)", [targetIds], (err, result) => {
+    if (err) {
+      console.error("Bulk delete user error:", err);
+      return res.status(500).json({ message: 'Failed to delete users' });
+    }
+    res.json({ message: `${result.affectedRows} users deleted successfully` });
   });
 });
 
@@ -1572,6 +1597,7 @@ db.query("SHOW COLUMNS FROM chain_of_command LIKE 'category'", (err, columns) =>
 });
 
 function initializeCoCTables() {
+  // 1. Create traditional tables first (for fallback/backwards-compatibility if any)
   db.query(`
     CREATE TABLE IF NOT EXISTS coc_categories (
       id INT AUTO_INCREMENT PRIMARY KEY,
@@ -1579,32 +1605,310 @@ function initializeCoCTables() {
       sort_order INT DEFAULT 0
     )
   `, (errCat) => {
-    if (errCat) {
-      console.error('Error creating coc_categories table:', errCat);
-      return;
+    if (!errCat) {
+      db.query(`
+        CREATE TABLE IF NOT EXISTS chain_of_command (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          category_id INT NOT NULL,
+          layout VARCHAR(50) DEFAULT 'detailed',
+          title VARCHAR(255) NOT NULL,
+          subtitle VARCHAR(255) DEFAULT NULL,
+          description TEXT DEFAULT NULL,
+          reports TEXT DEFAULT NULL,
+          reports_title VARCHAR(255) DEFAULT NULL,
+          footer TEXT DEFAULT NULL,
+          color VARCHAR(50) DEFAULT '#22d3ee',
+          sort_order INT DEFAULT 0,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (category_id) REFERENCES coc_categories(id) ON DELETE CASCADE
+        )
+      `, (errCoc) => {
+        if (!errCoc) {
+          seedCoC();
+        }
+      });
     }
+  });
 
-    db.query(`
-      CREATE TABLE IF NOT EXISTS chain_of_command (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        category_id INT NOT NULL,
-        layout VARCHAR(50) DEFAULT 'detailed', -- 'simple' or 'detailed'
-        title VARCHAR(255) NOT NULL,
-        subtitle VARCHAR(255) DEFAULT NULL,
-        description TEXT DEFAULT NULL,
-        reports TEXT DEFAULT NULL, -- JSON string representing array of group objects
-        footer TEXT DEFAULT NULL,
-        color VARCHAR(50) DEFAULT '#22d3ee',
-        sort_order INT DEFAULT 0,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (category_id) REFERENCES coc_categories(id) ON DELETE CASCADE
-      )
-    `, (errCoc) => {
-      if (errCoc) {
-        console.error('Error creating chain_of_command table:', errCoc);
-        return;
+  // 2. Create the new block-based Chain of Command table
+  db.query(`
+    CREATE TABLE IF NOT EXISTS chain_of_command_blocks (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      type VARCHAR(50) NOT NULL,
+      content JSON NOT NULL,
+      sort_order INT DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `, (errBlocks) => {
+    if (errBlocks) {
+      console.error('Error creating chain_of_command_blocks table:', errBlocks);
+    } else {
+      seedCoCBlocks();
+    }
+  });
+}
+
+function seedCoCBlocks() {
+  db.query("SELECT COUNT(*) as count FROM chain_of_command_blocks", (err, results) => {
+    if (err || !results || results[0].count > 0) return;
+
+    console.log("Seeding default Chain of Command blocks...");
+    const defaultBlocks = [
+      {
+        type: 'text',
+        content: JSON.stringify({
+          text: "ISSUED BY THE OFFICE OF THE PRESIDENT",
+          type: "paragraph",
+          color: "#22d3ee",
+          alignment: "center",
+          bold: true,
+          italic: false,
+          underline: false,
+          strikethrough: false
+        })
+      },
+      {
+        type: 'image',
+        content: JSON.stringify({
+          url: "https://i.imgur.com/YfVF1d0.png",
+          alt: "The Great Seal of the United States of Paraiso",
+          size: "md",
+          alignment: "center"
+        })
+      },
+      {
+        type: 'text',
+        content: JSON.stringify({
+          text: "BRIAN GUTIERREZ",
+          type: "title",
+          color: "#c9a84c",
+          alignment: "center",
+          bold: true,
+          italic: false,
+          underline: false,
+          strikethrough: false
+        })
+      },
+      {
+        type: 'text',
+        content: JSON.stringify({
+          text: "PRESIDENT OF THE UNITED STATES OF PARAISO",
+          type: "subtitle",
+          color: "#fbbf24",
+          alignment: "center",
+          bold: true,
+          italic: false,
+          underline: false,
+          strikethrough: false
+        })
+      },
+      {
+        type: 'text',
+        content: JSON.stringify({
+          text: "OFFICE OF THE PRESIDENT\nGOVERNMENT OF PARAISO",
+          type: "paragraph",
+          color: "#64748b",
+          alignment: "center",
+          bold: true,
+          italic: false,
+          underline: false,
+          strikethrough: false
+        })
+      },
+      {
+        type: 'half_box',
+        content: JSON.stringify({
+          color: "#22d3ee",
+          width: "full",
+          lines: [
+            { text: "INTRODUCTION", type: "title", bold: true, alignment: "left", color: "#22d3ee" },
+            { text: "The Government of Paraiso serves as the executive authority responsible for maintaining structure, organization, and oversight across the community.", type: "paragraph", alignment: "left", color: "#cbd5e1" },
+            { text: "Instead of having one person manage every department, responsibilities are divided between executive offices and specialized management teams.", type: "paragraph", alignment: "left", color: "#94a3b8" }
+          ]
+        })
+      },
+      {
+        type: 'title_strokes',
+        content: JSON.stringify({
+          text: "EXECUTIVE LEADERSHIP",
+          color: "#c9a84c"
+        })
+      },
+      {
+        type: 'half_box',
+        content: JSON.stringify({
+          color: "#c9a84c",
+          width: "half",
+          lines: [
+            { text: "PRESIDENT", type: "title", bold: true, alignment: "left", color: "#c9a84c" },
+            { text: "The highest-ranking official within the Government of Paraiso. The President sets the overall vision of the community and has final authority over major decisions, appointments, and policies.", type: "paragraph", alignment: "left", color: "#cbd5e1" }
+          ]
+        })
+      },
+      {
+        type: 'half_box',
+        content: JSON.stringify({
+          color: "#94a3b8",
+          width: "half",
+          lines: [
+            { text: "VICE PRESIDENT", type: "title", bold: true, alignment: "left", color: "#94a3b8" },
+            { text: "The second-highest executive official. The Vice President assists the President with government operations and acts on behalf of the President when necessary.", type: "paragraph", alignment: "left", color: "#cbd5e1" }
+          ]
+        })
+      },
+      {
+        type: 'title_strokes',
+        content: JSON.stringify({
+          text: "EXECUTIVE DEPARTMENTS",
+          color: "#22d3ee"
+        })
+      },
+      {
+        type: 'hybrid_box',
+        content: JSON.stringify({
+          color: "#22d3ee",
+          title: "SECRETARY OF DEFENSE",
+          subtitle: "Oversees all law enforcement and emergency service departments.",
+          columns_title: "REPORTS UNDER SECRETARY OF DEFENSE:",
+          sub_boxes: [
+            {
+              title: "ADMIN PERSONNEL",
+              items: ["Helper Management"]
+            },
+            {
+              title: "FACTION MANAGEMENT",
+              items: ["Paraiso Police Department", "Federal Bureau of Investigation", "Paraiso Fire & Medical Department", "National Guard", "San Andreas News"]
+            }
+          ],
+          footer: "Admin Personnel assists the Secretary of Defense in keeping Government employees on the right track. This includes professionalism, honor & loyalty. Aswel as issuing any punishments if any Government employees break the rules and or laws. Faction Management assists faction leaders, monitors activity, reviews department performance, and reports directly to the Secretary of Defense."
+        })
+      },
+      {
+        type: 'hybrid_box',
+        content: JSON.stringify({
+          color: "#22d3ee",
+          title: "SECRETARY OF STATE",
+          subtitle: "Oversees all civilian and criminal organizations operating throughout Paraiso.",
+          columns_title: "REPORTS UNDER SECRETARY OF STATE:",
+          sub_boxes: [
+            {
+              title: "GANG MANAGEMENT",
+              items: ["All Official Criminal Organizations"]
+            },
+            {
+              title: "CIVILIAN MANAGEMENT",
+              items: ["Paraiso News", "Taxi Services", "Future Civilian Organizations"]
+            }
+          ],
+          footer: "Gang Management works with gang leaders, their applications, and reports directly to the Secretary of State."
+        })
+      },
+      {
+        type: 'title_strokes',
+        content: JSON.stringify({
+          text: "WHY THIS SYSTEM EXISTS",
+          color: "#c9a84c"
+        })
+      },
+      {
+        type: 'text',
+        content: JSON.stringify({
+          text: "Each executive position oversees a specific area of the server:",
+          type: "subtitle",
+          color: "#cbd5e1",
+          alignment: "left",
+          bold: true,
+          italic: false,
+          underline: false,
+          strikethrough: false
+        })
+      },
+      {
+        type: 'half_box',
+        content: JSON.stringify({
+          color: "#c9a84c",
+          width: "full",
+          lines: [
+            { text: "PRESIDENT", type: "title", bold: true, color: "#c9a84c" },
+            { text: "→ The highest-ranking official within the Government of Paraiso. The President sets the overall vision of the community and has final authority over major decisions, appointments, and policies.", type: "paragraph", color: "#94a3b8" }
+          ]
+        })
+      },
+      {
+        type: 'half_box',
+        content: JSON.stringify({
+          color: "#94a3b8",
+          width: "full",
+          lines: [
+            { text: "VICE PRESIDENT", type: "title", bold: true, color: "#94a3b8" },
+            { text: "→ The second-highest executive official. The Vice President assists the President with government operations and acts on behalf of the President when necessary.", type: "paragraph", color: "#94a3b8" }
+          ]
+        })
+      },
+      {
+        type: 'half_box',
+        content: JSON.stringify({
+          color: "#22d3ee",
+          width: "full",
+          lines: [
+            { text: "SECRETARY OF DEFENSE", type: "title", bold: true, color: "#22d3ee" },
+            { text: "→ Government factions and emergency services.", type: "paragraph", color: "#94a3b8" }
+          ]
+        })
+      },
+      {
+        type: 'half_box',
+        content: JSON.stringify({
+          color: "#fbbf24",
+          width: "full",
+          lines: [
+            { text: "SECRETARY OF STATE", type: "title", bold: true, color: "#fbbf24" },
+            { text: "→ All criminal organizations.", type: "paragraph", color: "#94a3b8" }
+          ]
+        })
+      },
+      {
+        type: 'half_box',
+        content: JSON.stringify({
+          color: "#10b981",
+          width: "full",
+          lines: [
+            { text: "GOVERNOR", type: "title", bold: true, color: "#10b981" },
+            { text: "→ Businesses, economy, and commercial affairs.", type: "paragraph", color: "#94a3b8" }
+          ]
+        })
+      },
+      {
+        type: 'text',
+        content: JSON.stringify({
+          text: "This allows every faction, gang, and business organizations to receive proper leadership without one person having to manage everything directly.",
+          type: "paragraph",
+          color: "#94a3b8",
+          alignment: "left",
+          bold: false,
+          italic: true,
+          underline: false,
+          strikethrough: false
+        })
+      },
+      {
+        type: 'signature',
+        content: JSON.stringify({
+          name: "Brian Gutierrez",
+          role: "President of the United States of Paraiso",
+          office: "Office of the President",
+          color: "#fbbf24"
+        })
       }
-      seedCoC();
+    ];
+
+    const values = defaultBlocks.map((b, index) => [b.type, b.content, index]);
+    db.query("INSERT INTO chain_of_command_blocks (type, content, sort_order) VALUES ?", [values], (errInsert) => {
+      if (errInsert) {
+        console.error("Failed to seed chain_of_command_blocks:", errInsert);
+      } else {
+        console.log("Seeded chain_of_command_blocks successfully.");
+      }
     });
   });
 }
@@ -1835,18 +2139,18 @@ app.get('/chain-of-command', (req, res) => {
 
 // POST /chain-of-command — admin only with permission
 app.post('/chain-of-command', verifyPermission('coc'), (req, res) => {
-  const { category_id, layout, title, subtitle, description, reports, footer, color } = req.body;
+  const { category_id, layout, title, subtitle, description, reports, reports_title, footer, color } = req.body;
   if (!category_id || !title) return res.status(400).json({ message: 'Category and Title are required' });
 
   db.query("SELECT MAX(sort_order) as maxOrder FROM chain_of_command WHERE category_id = ?", [category_id], (err, orderResult) => {
     const nextOrder = (orderResult && orderResult[0]?.maxOrder !== null) ? orderResult[0].maxOrder + 1 : 0;
 
     db.query(
-      "INSERT INTO chain_of_command (category_id, layout, title, subtitle, description, reports, footer, color, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      [category_id, layout || 'detailed', title, subtitle, description, reports ? JSON.stringify(reports) : null, footer, color || '#22d3ee', nextOrder],
+      "INSERT INTO chain_of_command (category_id, layout, title, subtitle, description, reports, reports_title, footer, color, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      [category_id, layout || 'detailed', title, subtitle, description, reports ? JSON.stringify(reports) : null, reports_title || null, footer, color || '#22d3ee', nextOrder],
       (errInsert, result) => {
         if (errInsert) return res.status(500).json({ message: 'Failed to create CoC entry: ' + errInsert.message });
-        res.status(201).json({ id: result.insertId, category_id, layout, title, subtitle, description, reports, footer, color, sort_order: nextOrder });
+        res.status(201).json({ id: result.insertId, category_id, layout, title, subtitle, description, reports, reports_title, footer, color, sort_order: nextOrder });
       }
     );
   });
@@ -1876,12 +2180,12 @@ app.put('/chain-of-command/reorder', verifyPermission('coc'), (req, res) => {
 
 // PUT /chain-of-command/:id — admin only with permission
 app.put('/chain-of-command/:id', verifyPermission('coc'), (req, res) => {
-  const { category_id, layout, title, subtitle, description, reports, footer, color } = req.body;
+  const { category_id, layout, title, subtitle, description, reports, reports_title, footer, color } = req.body;
   if (!category_id || !title) return res.status(400).json({ message: 'Category and Title are required' });
 
   db.query(
-    "UPDATE chain_of_command SET category_id = ?, layout = ?, title = ?, subtitle = ?, description = ?, reports = ?, footer = ?, color = ? WHERE id = ?",
-    [category_id, layout, title, subtitle, description, reports ? JSON.stringify(reports) : null, footer, color, req.params.id],
+    "UPDATE chain_of_command SET category_id = ?, layout = ?, title = ?, subtitle = ?, description = ?, reports = ?, reports_title = ?, footer = ?, color = ? WHERE id = ?",
+    [category_id, layout, title, subtitle, description, reports ? JSON.stringify(reports) : null, reports_title || null, footer, color, req.params.id],
     (err, result) => {
       if (err) return res.status(500).json({ message: 'Failed to update CoC entry: ' + err.message });
       res.json({ message: 'Chain of Command entry updated successfully' });
@@ -1894,6 +2198,129 @@ app.delete('/chain-of-command/:id', verifyPermission('coc'), (req, res) => {
   db.query("DELETE FROM chain_of_command WHERE id = ?", [req.params.id], (err) => {
     if (err) return res.status(500).json({ message: 'Failed to delete CoC entry' });
     res.json({ message: 'Chain of Command entry deleted' });
+  });
+});
+
+
+// ════════════════════════════════════════════════════════════
+// BLOCK-BASED CHAIN OF COMMAND ENDPOINTS
+// ════════════════════════════════════════════════════════════
+
+// GET /chain-of-command/blocks — fetch all blocks
+app.get('/chain-of-command/blocks', (req, res) => {
+  db.query("SELECT * FROM chain_of_command_blocks ORDER BY sort_order ASC", (err, results) => {
+    if (err) {
+      console.error(err);
+      return res.status(500).json({ message: 'Database error: ' + err.message });
+    }
+    // Parse JSON contents
+    const parsed = results.map(row => {
+      let content = row.content;
+      if (typeof content === 'string') {
+        try {
+          content = JSON.parse(content);
+        } catch (e) {
+          // ignore
+        }
+      }
+      return { ...row, content };
+    });
+    res.json(parsed);
+  });
+});
+
+// POST /chain-of-command/blocks — add a block (admin only with permission)
+app.post('/chain-of-command/blocks', verifyPermission('coc'), (req, res) => {
+  const { type, content } = req.body;
+  if (!type || !content) return res.status(400).json({ message: 'Type and Content are required' });
+
+  // Get max sort order
+  db.query("SELECT MAX(sort_order) as maxOrder FROM chain_of_command_blocks", (err, orderResult) => {
+    const nextOrder = (orderResult && orderResult[0].maxOrder !== null) ? orderResult[0].maxOrder + 1 : 0;
+    
+    db.query(
+      "INSERT INTO chain_of_command_blocks (type, content, sort_order) VALUES (?, ?, ?)",
+      [type, typeof content === 'string' ? content : JSON.stringify(content), nextOrder],
+      (errInsert, result) => {
+        if (errInsert) return res.status(500).json({ message: 'Failed to create block: ' + errInsert.message });
+        res.json({ id: result.insertId, message: 'Block created successfully' });
+      }
+    );
+  });
+});
+
+// PUT /chain-of-command/blocks/reorder — reorder blocks (admin only with permission)
+app.put('/chain-of-command/blocks/reorder', verifyPermission('coc'), (req, res) => {
+  const { orders } = req.body; // array of { id, sort_order }
+  if (!Array.isArray(orders)) return res.status(400).json({ message: 'Orders list is required' });
+
+  let completed = 0;
+  let hasError = false;
+
+  orders.forEach(item => {
+    db.query("UPDATE chain_of_command_blocks SET sort_order = ? WHERE id = ?", [item.sort_order, item.id], (err) => {
+      if (err && !hasError) {
+        hasError = true;
+        return res.status(500).json({ message: 'Reorder failed', error: err.message });
+      }
+      completed++;
+      if (completed === orders.length && !hasError) {
+        res.json({ message: 'Blocks reordered successfully' });
+      }
+    });
+  });
+});
+
+// PUT /chain-of-command/blocks/:id — update a block (admin only with permission)
+app.put('/chain-of-command/blocks/:id', verifyPermission('coc'), (req, res) => {
+  const { type, content } = req.body;
+  if (!type || !content) return res.status(400).json({ message: 'Type and Content are required' });
+
+  db.query(
+    "UPDATE chain_of_command_blocks SET type = ?, content = ? WHERE id = ?",
+    [type, typeof content === 'string' ? content : JSON.stringify(content), req.params.id],
+    (err, result) => {
+      if (err) return res.status(500).json({ message: 'Failed to update block: ' + err.message });
+      res.json({ message: 'Block updated successfully' });
+    }
+  );
+});
+
+// DELETE /chain-of-command/blocks/:id — delete a block (admin only with permission)
+app.delete('/chain-of-command/blocks/:id', verifyPermission('coc'), (req, res) => {
+  db.query("DELETE FROM chain_of_command_blocks WHERE id = ?", [req.params.id], (err) => {
+    if (err) return res.status(500).json({ message: 'Failed to delete block' });
+    res.json({ message: 'Block deleted successfully' });
+  });
+});
+
+// POST /upload — base64 image upload route (admin only)
+app.post('/upload', verifyAdmin, (req, res) => {
+  const { image } = req.body; // base64 string
+  if (!image) return res.status(400).json({ message: 'No image data provided' });
+
+  // Remove header
+  const matches = image.match(/^data:image\/([A-Za-z-+\/]+);base64,(.+)$/);
+  if (!matches || matches.length !== 3) {
+    return res.status(400).json({ message: 'Invalid base64 image format' });
+  }
+
+  const ext = matches[1];
+  const dataBuffer = Buffer.from(matches[2], 'base64');
+  const filename = `img_${Date.now()}.${ext === 'jpeg' ? 'jpg' : ext}`;
+  const uploadDir = path.join(__dirname, 'uploads');
+
+  if (!fs.existsSync(uploadDir)) {
+    fs.mkdirSync(uploadDir);
+  }
+
+  fs.writeFile(path.join(uploadDir, filename), dataBuffer, (err) => {
+    if (err) {
+      console.error('File write error:', err);
+      return res.status(500).json({ message: 'Failed to save image' });
+    }
+    const url = `${req.protocol}://${req.get('host')}/uploads/${filename}`;
+    res.json({ url });
   });
 });
 
