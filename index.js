@@ -890,8 +890,8 @@ app.put('/roster/reorder', verifyPermission('roster'), (req, res) => {
   });
 });
 
-// PUT /roster/govt-header — admin only with permission
-app.put('/roster/govt-header', verifyPermission('roster'), (req, res) => {
+// PUT /page-settings/govt-header — admin only with permission
+app.put('/page-settings/govt-header', verifyPermission('roster'), (req, res) => {
   const { image_url, title, subtitle, title_color, subtitle_color, footer_quote } = req.body;
   const content = JSON.stringify({ image_url, title, subtitle, title_color, subtitle_color, footer_quote });
   const sql = `
@@ -1261,8 +1261,8 @@ app.put('/roster/chain-of-command', verifyPermission('roster'), (req, res) => {
 });
 
 
-// GET /roster/govt-header — public
-app.get('/roster/govt-header', (req, res) => {
+// GET /page-settings/govt-header — public
+app.get('/page-settings/govt-header', (req, res) => {
   const defaultHeader = JSON.stringify({
     image_url: 'https://i.imgur.com/YfVF1d0.png',
     title: 'THE UNITED STATES OF PARAISO',
