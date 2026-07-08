@@ -890,6 +890,21 @@ app.put('/roster/reorder', verifyPermission('roster'), (req, res) => {
   });
 });
 
+// PUT /roster/govt-header — admin only with permission
+app.put('/roster/govt-header', verifyPermission('roster'), (req, res) => {
+  const { image_url, title, subtitle, title_color, subtitle_color, footer_quote } = req.body;
+  const content = JSON.stringify({ image_url, title, subtitle, title_color, subtitle_color, footer_quote });
+  const sql = `
+    INSERT INTO page_contents (page_key, content)
+    VALUES ('govt-roster-header', ?)
+    ON DUPLICATE KEY UPDATE content = ?
+  `;
+  db.query(sql, [content, content], (err) => {
+    if (err) return res.status(500).json({ message: 'Failed to save header settings', error: err });
+    res.json({ message: 'Government Roster header updated successfully' });
+  });
+});
+
 // PUT /roster/:id — admin only with permission, update a member
 app.put('/roster/:id', verifyPermission('roster'), (req, res) => {
   const { section, title, name, description, section_order, sort_order, color, name_color } = req.body;
@@ -1242,6 +1257,37 @@ app.put('/roster/chain-of-command', verifyPermission('roster'), (req, res) => {
   db.query(sql, [content, content], (err) => {
     if (err) return res.status(500).json({ message: 'Failed to save chain of command data', error: err });
     res.json({ message: 'Chain of command updated successfully' });
+  });
+});
+
+
+// GET /roster/govt-header — public
+app.get('/roster/govt-header', (req, res) => {
+  const defaultHeader = JSON.stringify({
+    image_url: 'https://i.imgur.com/YfVF1d0.png',
+    title: 'THE UNITED STATES OF PARAISO',
+    subtitle: 'Official Government Directory',
+    title_color: '#c9a84c',
+    subtitle_color: '#b9bbbe',
+    footer_quote: 'One Nation. One Government. One Paraiso.'
+  });
+  const sql = `
+    INSERT INTO page_contents (page_key, content)
+    VALUES ('govt-roster-header', ?)
+    ON DUPLICATE KEY UPDATE page_key = page_key
+  `;
+  db.query(sql, [defaultHeader], () => {
+    db.query("SELECT content FROM page_contents WHERE page_key = 'govt-roster-header'", (err2, results) => {
+      if (err2) return res.status(500).json({ message: 'DB error', error: err2 });
+      if (results && results.length > 0) {
+        try {
+          return res.json(JSON.parse(results[0].content));
+        } catch {
+          return res.json(JSON.parse(defaultHeader));
+        }
+      }
+      return res.json(JSON.parse(defaultHeader));
+    });
   });
 });
 
@@ -1678,7 +1724,7 @@ function seedCoCBlocks() {
       {
         type: 'image',
         content: JSON.stringify({
-          url: "https://i.imgur.com/YfVF1d0.png",
+          url: "https://imgur.com/y9chPQI.png",
           alt: "The Great Seal of the United States of Paraiso",
           size: "md",
           alignment: "center"
