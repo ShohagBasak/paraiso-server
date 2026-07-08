@@ -894,14 +894,16 @@ app.put('/roster/reorder', verifyPermission('roster'), (req, res) => {
 app.put('/page-settings/govt-header', verifyPermission('roster'), (req, res) => {
   const { image_url, title, subtitle, title_color, subtitle_color, footer_quote } = req.body;
   const content = JSON.stringify({ image_url, title, subtitle, title_color, subtitle_color, footer_quote });
-  const sql = `
-    INSERT INTO page_contents (page_key, content)
-    VALUES ('govt-roster-header', ?)
-    ON DUPLICATE KEY UPDATE content = ?
-  `;
-  db.query(sql, [content, content], (err) => {
-    if (err) return res.status(500).json({ message: 'Failed to save header settings', error: err });
-    res.json({ message: 'Government Roster header updated successfully' });
+
+  // First delete all rows with this key to avoid duplicates
+  db.query("DELETE FROM page_contents WHERE page_key = 'govt-roster-header'", (err) => {
+    if (err) return res.status(500).json({ message: 'Failed to clean old header settings', error: err });
+
+    // Then insert the new configuration
+    db.query("INSERT INTO page_contents (page_key, content) VALUES ('govt-roster-header', ?)", [content], (err2) => {
+      if (err2) return res.status(500).json({ message: 'Failed to save header settings', error: err2 });
+      res.json({ message: 'Government Roster header updated successfully' });
+    });
   });
 });
 
@@ -1271,21 +1273,22 @@ app.get('/page-settings/govt-header', (req, res) => {
     subtitle_color: '#b9bbbe',
     footer_quote: 'One Nation. One Government. One Paraiso.'
   });
-  const sql = `
-    INSERT INTO page_contents (page_key, content)
-    VALUES ('govt-roster-header', ?)
-    ON DUPLICATE KEY UPDATE page_key = page_key
-  `;
-  db.query(sql, [defaultHeader], () => {
-    db.query("SELECT content FROM page_contents WHERE page_key = 'govt-roster-header'", (err2, results) => {
-      if (err2) return res.status(500).json({ message: 'DB error', error: err2 });
-      if (results && results.length > 0) {
-        try {
-          return res.json(JSON.parse(results[0].content));
-        } catch {
-          return res.json(JSON.parse(defaultHeader));
-        }
+
+  // Fetch the latest config based on update time to ignore old defaults
+  db.query("SELECT content FROM page_contents WHERE page_key = 'govt-roster-header' ORDER BY updated_at DESC", (err, results) => {
+    if (err) return res.status(500).json({ message: 'DB error', error: err });
+    
+    if (results && results.length > 0) {
+      try {
+        return res.json(JSON.parse(results[0].content));
+      } catch {
+        return res.json(JSON.parse(defaultHeader));
       }
+    }
+
+    // Seed default if database is empty
+    db.query("INSERT INTO page_contents (page_key, content) VALUES ('govt-roster-header', ?)", [defaultHeader], (err2) => {
+      if (err2) console.error("Error inserting default header:", err2);
       return res.json(JSON.parse(defaultHeader));
     });
   });
