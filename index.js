@@ -72,6 +72,20 @@ db.query(`
   }
 });
 
+// ─── Initialize Allowed Registration Emails Table ─────────────
+db.query(`
+  CREATE TABLE IF NOT EXISTS allowed_registration_emails (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    email VARCHAR(150) NOT NULL UNIQUE,
+    added_by INT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (added_by) REFERENCES users(id) ON DELETE SET NULL
+  )
+`, (err) => {
+  if (err) console.error("Error creating allowed_registration_emails table:", err);
+  else console.log("Verified allowed_registration_emails table exists.");
+});
+
 // ─── verifyToken Middleware ────────────────────────────────
 function verifyToken(req, res, next) {
   let token = req.cookies.token;
@@ -149,70 +163,136 @@ app.get('/me', verifyToken, (req, res) => {
   });
 });
 
-// ─── POST /register ───────────────────────────────────────
-app.post('/register', async (req, res) => {
+// ─── POST /register (Master Admin only — creates new users) ───
+app.post('/register', verifyMaster, async (req, res) => {
   try {
-    console.log("========== REGISTER HIT ==========");
-    console.log("Body:", req.body);
+    // console.log("========== REGISTER HIT (Master Admin) ==========");
+    // console.log("Body:", req.body);
 
-    const { username, email, password } = req.body;
-    const allowedDomain = "@gmail.com";
+    const { username, email, password, role: newRole, permissions } = req.body;
 
-    if (!email.endsWith(allowedDomain)) {
-      console.log("Invalid email domain");
+    if (!username || !email || !password) {
+      return res.status(400).json({ message: "Username, email, and password are required." });
+    }
+
+    // ─── Check email whitelist ───
+    const [whitelistRows] = await db.promise().query(
+      "SELECT id FROM allowed_registration_emails WHERE email = ?",
+      [email]
+    );
+    if (!whitelistRows || whitelistRows.length === 0) {
       return res.status(403).json({
-        message: "Only Gmail addresses are allowed!"
+        message: `This email is not whitelisted. Please add "${email}" to the allowed list first.`
       });
     }
 
+    const assignedRole = ['admin', 'master', 'user'].includes(newRole) ? newRole : 'admin';
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    const sql = `
-      INSERT INTO users (username, email, password_hash)
-      VALUES (?, ?, ?)
-    `;
+    const sql = `INSERT INTO users (username, email, password_hash, role) VALUES (?, ?, ?, ?)`;
 
-    db.query(sql, [username, email, hashedPassword], (err, result) => {
+    db.query(sql, [username, email, hashedPassword, assignedRole], async (err, result) => {
       if (err) {
-        console.error("DATABASE ERROR:");
-        console.error(err);
-        return res.status(500).json({
-          message: "Registration failed. Email may already exist."
-        });
+        console.error("DATABASE ERROR:", err);
+        if (err.code === 'ER_DUP_ENTRY') {
+          return res.status(409).json({ message: "An account with this email already exists." });
+        }
+        return res.status(500).json({ message: "Registration failed. Please try again." });
       }
 
-      const token = jwt.sign(
-        {
-          id: result.insertId,
-          email,
-          role: "user"
-        },
-        process.env.JWT_SECRET,
-        { expiresIn: "7d" }
-      );
+      const newUserId = result.insertId;
 
-      res.cookie("token", token, cookieOptions);
-      console.log("User registered successfully:", email);
+      // ─── Save permissions if role is admin and permissions provided ───
+      const validPermKeys = ['banners', 'announcements', 'staff', 'roster', 'helper-roster', 'faqs', 'coc'];
+      const permsToSave = Array.isArray(permissions)
+        ? permissions.filter(p => validPermKeys.includes(p))
+        : [];
+
+      if (assignedRole === 'admin' && permsToSave.length > 0) {
+        const permValues = permsToSave.map(p => [newUserId, p]);
+        db.query(
+          "INSERT IGNORE INTO admin_permissions (user_id, permission_key) VALUES ?",
+          [permValues],
+          (permErr) => {
+            if (permErr) console.error("Failed to save permissions:", permErr);
+          }
+        );
+      }
+
+      // Remove email from whitelist after successful registration
+      db.query("DELETE FROM allowed_registration_emails WHERE email = ?", [email], (delErr) => {
+        if (delErr) console.error("Failed to remove email from whitelist after registration:", delErr);
+      });
+
+      // console.log(`User registered by master admin: ${email} (role: ${assignedRole}, perms: ${permsToSave.join(', ') || 'none'})`);
 
       res.status(201).json({
-        token,
+        message: `User "${username}" created successfully with role "${assignedRole}".`,
         user: {
-          id: result.insertId,
+          id: newUserId,
           username,
           email,
-          role: "user"
+          role: assignedRole,
+          permissions: permsToSave
         }
       });
     });
 
   } catch (err) {
-    console.error("REGISTER CRASH:");
-    console.error(err);
-
-    res.status(500).json({
-      message: err.message
-    });
+    console.error("REGISTER CRASH:", err);
+    res.status(500).json({ message: err.message });
   }
+});
+
+
+// ─── GET /allowed-emails ───────────────────────────────────
+app.get('/allowed-emails', verifyMaster, (req, res) => {
+  db.query(
+    "SELECT id, email, added_by, created_at FROM allowed_registration_emails ORDER BY created_at DESC",
+    (err, results) => {
+      if (err) return res.status(500).json({ message: 'Failed to fetch allowed emails' });
+      res.json(results);
+    }
+  );
+});
+
+// ─── POST /allowed-emails ──────────────────────────────────
+app.post('/allowed-emails', verifyMaster, (req, res) => {
+  const { email } = req.body;
+  if (!email || !email.includes('@')) {
+    return res.status(400).json({ message: 'A valid email address is required.' });
+  }
+  db.query(
+    "INSERT INTO allowed_registration_emails (email, added_by) VALUES (?, ?)",
+    [email.toLowerCase().trim(), req.user.id],
+    (err, result) => {
+      if (err) {
+        if (err.code === 'ER_DUP_ENTRY') {
+          return res.status(409).json({ message: 'This email is already in the whitelist.' });
+        }
+        return res.status(500).json({ message: 'Failed to add email to whitelist.' });
+      }
+      res.status(201).json({
+        message: `Email "${email}" added to whitelist.`,
+        id: result.insertId,
+        email: email.toLowerCase().trim()
+      });
+    }
+  );
+});
+
+// ─── DELETE /allowed-emails/:id ───────────────────────────
+app.delete('/allowed-emails/:id', verifyMaster, (req, res) => {
+  const { id } = req.params;
+  db.query(
+    "DELETE FROM allowed_registration_emails WHERE id = ?",
+    [id],
+    (err, result) => {
+      if (err) return res.status(500).json({ message: 'Failed to remove email from whitelist.' });
+      if (result.affectedRows === 0) return res.status(404).json({ message: 'Email not found in whitelist.' });
+      res.json({ message: 'Email removed from whitelist.' });
+    }
+  );
 });
 
 // ─── POST /login ──────────────────────────────────────────
@@ -224,6 +304,14 @@ app.post('/login', (req, res) => {
     const match = await bcrypt.compare(password, results[0].password_hash);
     if (!match) return res.status(401).json({ message: "Invalid password" });
     const { id, username, role } = results[0];
+
+    // ─── Security: Block normal users from logging in ───
+    if (role !== 'admin' && role !== 'master') {
+      return res.status(403).json({ 
+        message: "Access denied. Only admins can log in to the panel." 
+      });
+    }
+
     const token = jwt.sign({ id, email, role }, process.env.JWT_SECRET, { expiresIn: '7d' });
     res.cookie('token', token, cookieOptions);
     
@@ -251,7 +339,7 @@ app.post('/reset-password', async (req, res) => {
   });
 });
 
-// ─── POST /logout ─────────────────────────────────────────
+//  POST /logout 
 app.post('/logout', (req, res) => {
   res.clearCookie('token', {
     httpOnly: true,
