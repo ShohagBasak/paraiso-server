@@ -325,8 +325,8 @@ app.post('/login', (req, res) => {
   });
 });
 
-// ─── POST /reset-password ─────────────────────────────────
-app.post('/reset-password', async (req, res) => {
+// ─── POST /reset-password (Master Admin only) ─────────────
+app.post('/reset-password', verifyMaster, async (req, res) => {
   const { email, newPassword } = req.body;
   if (!email || !newPassword) return res.status(400).json({ message: 'Email and new password are required' });
   db.query("SELECT id FROM users WHERE email = ?", [email], async (err, results) => {
@@ -360,7 +360,6 @@ app.get('/banners', (req, res) => {
   });
 });
 
-// PUT /banners/reorder — update sort order (admin only)
 // PUT /banners/reorder — update sort order (admin only with permission)
 app.put('/banners/reorder', verifyPermission('banners'), (req, res) => {
   const { orders } = req.body;
