@@ -1,4 +1,5 @@
 const express = require('express');
+const http = require('http');
 const db = require('./db');
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
@@ -7,8 +8,10 @@ const path = require('path');
 require('dotenv').config();
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
+const { Server } = require('socket.io');
 
 const app = express();
+const server = http.createServer(app);
 
 const allowedOrigins = [
   'http://localhost:5173',
@@ -84,6 +87,82 @@ db.query(`
 `, (err) => {
   if (err) console.error("Error creating allowed_registration_emails table:", err);
   else console.log("Verified allowed_registration_emails table exists.");
+});
+
+// ─── Initialize Donate Categories Table ───────────────────
+db.query(`
+  CREATE TABLE IF NOT EXISTS donate_categories (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    sort_order INT DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  )
+`, (err) => {
+  if (err) console.error("Error creating donate_categories table:", err);
+  else console.log("Verified donate_categories table exists.");
+});
+
+// ─── Initialize Donate Items Table ────────────────────────
+db.query(`
+  CREATE TABLE IF NOT EXISTS donate_items (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    category_id INT NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    image_url TEXT,
+    price DECIMAL(10,2) DEFAULT 0.00,
+    is_active BOOLEAN DEFAULT TRUE,
+    sort_order INT DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (category_id) REFERENCES donate_categories(id) ON DELETE CASCADE
+  )
+`, (err) => {
+  if (err) console.error("Error creating donate_items table:", err);
+  else console.log("Verified donate_items table exists.");
+});
+
+// ─── Initialize Purchase Tickets Table ────────────────────
+db.query(`
+  CREATE TABLE IF NOT EXISTS purchase_tickets (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    item_id INT NOT NULL,
+    ingame_name VARCHAR(255) DEFAULT '',
+    discord_username VARCHAR(255) DEFAULT '',
+    quantity INT DEFAULT 1,
+    status ENUM('open','claimed','closed') DEFAULT 'open',
+    assigned_admin_id INT DEFAULT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (item_id) REFERENCES donate_items(id) ON DELETE CASCADE,
+    FOREIGN KEY (assigned_admin_id) REFERENCES users(id) ON DELETE SET NULL
+  )
+`, (err) => {
+  if (err) console.error("Error creating purchase_tickets table:", err);
+  else {
+    console.log("Verified purchase_tickets table exists.");
+    // Auto-alter table to ensure new columns exist for existing databases
+    db.query("ALTER TABLE purchase_tickets ADD COLUMN IF NOT EXISTS ingame_name VARCHAR(255) DEFAULT ''", () => {});
+    db.query("ALTER TABLE purchase_tickets ADD COLUMN IF NOT EXISTS discord_username VARCHAR(255) DEFAULT ''", () => {});
+    db.query("ALTER TABLE purchase_tickets ADD COLUMN IF NOT EXISTS quantity INT DEFAULT 1", () => {});
+  }
+});
+
+// ─── Initialize Ticket Messages Table ─────────────────────
+db.query(`
+  CREATE TABLE IF NOT EXISTS ticket_messages (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    ticket_id INT NOT NULL,
+    sender_id INT NOT NULL,
+    message TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (ticket_id) REFERENCES purchase_tickets(id) ON DELETE CASCADE,
+    FOREIGN KEY (sender_id) REFERENCES users(id) ON DELETE CASCADE
+  )
+`, (err) => {
+  if (err) console.error("Error creating ticket_messages table:", err);
+  else console.log("Verified ticket_messages table exists.");
 });
 
 // ─── verifyToken Middleware ────────────────────────────────
@@ -203,7 +282,7 @@ app.post('/register', verifyMaster, async (req, res) => {
       const newUserId = result.insertId;
 
       // ─── Save permissions if role is admin and permissions provided ───
-      const validPermKeys = ['banners', 'announcements', 'staff', 'roster', 'helper-roster', 'faqs', 'coc'];
+      const validPermKeys = ['banners', 'announcements', 'staff', 'roster', 'helper-roster', 'faqs', 'coc', 'donate', 'tickets'];
       const permsToSave = Array.isArray(permissions)
         ? permissions.filter(p => validPermKeys.includes(p))
         : [];
@@ -295,6 +374,42 @@ app.delete('/allowed-emails/:id', verifyMaster, (req, res) => {
   );
 });
 
+// ─── POST /public-register (Public — community user registration) ───
+app.post('/public-register', async (req, res) => {
+  try {
+    const { username, email, password } = req.body;
+    if (!username || !email || !password) {
+      return res.status(400).json({ message: "Username, email, and password are required." });
+    }
+    if (password.length < 6) {
+      return res.status(400).json({ message: "Password must be at least 6 characters." });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const sql = `INSERT INTO users (username, email, password_hash, role) VALUES (?, ?, ?, 'user')`;
+
+    db.query(sql, [username, email.toLowerCase().trim(), hashedPassword], (err, result) => {
+      if (err) {
+        if (err.code === 'ER_DUP_ENTRY') {
+          return res.status(409).json({ message: "An account with this email already exists." });
+        }
+        return res.status(500).json({ message: "Registration failed. Please try again." });
+      }
+      const newUserId = result.insertId;
+      const token = jwt.sign({ id: newUserId, email: email.toLowerCase().trim(), role: 'user' }, process.env.JWT_SECRET, { expiresIn: '7d' });
+      res.cookie('token', token, cookieOptions);
+      res.status(201).json({
+        message: 'Registration successful!',
+        token,
+        user: { id: newUserId, username, email: email.toLowerCase().trim(), role: 'user', permissions: [] }
+      });
+    });
+  } catch (err) {
+    console.error("PUBLIC REGISTER CRASH:", err);
+    res.status(500).json({ message: err.message });
+  }
+});
+
 // ─── POST /login ──────────────────────────────────────────
 app.post('/login', (req, res) => {
   const { email, password } = req.body;
@@ -304,13 +419,6 @@ app.post('/login', (req, res) => {
     const match = await bcrypt.compare(password, results[0].password_hash);
     if (!match) return res.status(401).json({ message: "Invalid password" });
     const { id, username, role } = results[0];
-
-    // ─── Security: Block normal users from logging in ───
-    if (role !== 'admin' && role !== 'master') {
-      return res.status(403).json({ 
-        message: "Access denied. Only admins can log in to the panel." 
-      });
-    }
 
     const token = jwt.sign({ id, email, role }, process.env.JWT_SECRET, { expiresIn: '7d' });
     res.cookie('token', token, cookieOptions);
@@ -2469,7 +2577,483 @@ app.post('/upload', verifyAdmin, (req, res) => {
 });
 
 
+// ════════════════════════════════════════════════════════════
+// DONATE CATEGORIES ENDPOINTS
+// ════════════════════════════════════════════════════════════
+
+// GET /donate-categories — public: list all categories with item counts
+app.get('/donate-categories', (req, res) => {
+  db.query(
+    `SELECT c.*, COUNT(i.id) as item_count 
+     FROM donate_categories c 
+     LEFT JOIN donate_items i ON i.category_id = c.id AND i.is_active = 1
+     GROUP BY c.id 
+     ORDER BY c.sort_order ASC, c.id ASC`,
+    (err, results) => {
+      if (err) return res.status(500).json({ message: 'Failed to fetch categories' });
+      res.json(results);
+    }
+  );
+});
+
+// POST /donate-categories — admin: create category
+app.post('/donate-categories', verifyPermission('donate'), (req, res) => {
+  const { name } = req.body;
+  if (!name) return res.status(400).json({ message: 'Category name is required' });
+  db.query("SELECT MAX(sort_order) as maxOrder FROM donate_categories", (err, orderResult) => {
+    const nextOrder = (orderResult && orderResult[0]?.maxOrder !== null) ? orderResult[0].maxOrder + 1 : 0;
+    db.query("INSERT INTO donate_categories (name, sort_order) VALUES (?, ?)", [name, nextOrder], (err2, result) => {
+      if (err2) return res.status(500).json({ message: 'Failed to create category' });
+      res.status(201).json({ message: 'Category created', id: result.insertId, name, sort_order: nextOrder });
+    });
+  });
+});
+
+// PUT /donate-categories/:id — admin: update category
+app.put('/donate-categories/:id', verifyPermission('donate'), (req, res) => {
+  const { name } = req.body;
+  if (!name) return res.status(400).json({ message: 'Category name is required' });
+  db.query("UPDATE donate_categories SET name = ? WHERE id = ?", [name, req.params.id], (err) => {
+    if (err) return res.status(500).json({ message: 'Failed to update category' });
+    res.json({ message: 'Category updated' });
+  });
+});
+
+// DELETE /donate-categories/:id — admin: delete category
+app.delete('/donate-categories/:id', verifyPermission('donate'), (req, res) => {
+  db.query("DELETE FROM donate_categories WHERE id = ?", [req.params.id], (err) => {
+    if (err) return res.status(500).json({ message: 'Failed to delete category' });
+    res.json({ message: 'Category deleted' });
+  });
+});
+
+// PUT /donate-categories/reorder — admin: reorder categories
+app.put('/donate-categories-reorder', verifyPermission('donate'), (req, res) => {
+  const { orders } = req.body;
+  if (!Array.isArray(orders)) return res.status(400).json({ message: 'Invalid data' });
+  if (orders.length === 0) return res.json({ message: 'Order updated' });
+  let completed = 0;
+  let hasError = false;
+  orders.forEach((item) => {
+    db.query("UPDATE donate_categories SET sort_order = ? WHERE id = ?", [item.sort_order, item.id], (err) => {
+      if (err && !hasError) { hasError = true; return res.status(500).json({ message: 'Failed to update order' }); }
+      completed++;
+      if (completed === orders.length && !hasError) res.json({ message: 'Categories reordered' });
+    });
+  });
+});
+
+// ════════════════════════════════════════════════════════════
+// DONATE ITEMS ENDPOINTS
+// ════════════════════════════════════════════════════════════
+
+// GET /donate-items — public: list items (optional ?category_id= filter)
+app.get('/donate-items', (req, res) => {
+  const { category_id } = req.query;
+  let sql = `SELECT i.*, c.name as category_name 
+             FROM donate_items i 
+             LEFT JOIN donate_categories c ON c.id = i.category_id 
+             WHERE i.is_active = 1`;
+  const params = [];
+  if (category_id) {
+    sql += ' AND i.category_id = ?';
+    params.push(category_id);
+  }
+  sql += ' ORDER BY i.sort_order ASC, i.id DESC';
+  db.query(sql, params, (err, results) => {
+    if (err) return res.status(500).json({ message: 'Failed to fetch items' });
+    res.json(results);
+  });
+});
+
+// GET /donate-items/all — admin: list ALL items including inactive
+app.get('/donate-items/all', verifyPermission('donate'), (req, res) => {
+  db.query(
+    `SELECT i.*, c.name as category_name 
+     FROM donate_items i 
+     LEFT JOIN donate_categories c ON c.id = i.category_id 
+     ORDER BY i.sort_order ASC, i.id DESC`,
+    (err, results) => {
+      if (err) return res.status(500).json({ message: 'Failed to fetch items' });
+      res.json(results);
+    }
+  );
+});
+
+// GET /donate-items/:id — public: single item
+app.get('/donate-items/:id', (req, res) => {
+  db.query(
+    `SELECT i.*, c.name as category_name 
+     FROM donate_items i 
+     LEFT JOIN donate_categories c ON c.id = i.category_id 
+     WHERE i.id = ?`,
+    [req.params.id],
+    (err, results) => {
+      if (err || results.length === 0) return res.status(404).json({ message: 'Item not found' });
+      res.json(results[0]);
+    }
+  );
+});
+
+// POST /donate-items — admin: create item
+app.post('/donate-items', verifyPermission('donate'), (req, res) => {
+  const { category_id, name, description, image_url, price } = req.body;
+  if (!category_id || !name) return res.status(400).json({ message: 'Category and name are required' });
+  db.query("SELECT MAX(sort_order) as maxOrder FROM donate_items", (err, orderResult) => {
+    const nextOrder = (orderResult && orderResult[0]?.maxOrder !== null) ? orderResult[0].maxOrder + 1 : 0;
+    db.query(
+      "INSERT INTO donate_items (category_id, name, description, image_url, price, sort_order) VALUES (?, ?, ?, ?, ?, ?)",
+      [category_id, name, description || '', image_url || '', price || 0, nextOrder],
+      (err2, result) => {
+        if (err2) return res.status(500).json({ message: 'Failed to create item' });
+        res.status(201).json({ message: 'Item created', id: result.insertId });
+      }
+    );
+  });
+});
+
+// PUT /donate-items/:id — admin: update item
+app.put('/donate-items/:id', verifyPermission('donate'), (req, res) => {
+  const { category_id, name, description, image_url, price, is_active } = req.body;
+  db.query(
+    `UPDATE donate_items SET 
+      category_id = COALESCE(?, category_id),
+      name = COALESCE(?, name),
+      description = COALESCE(?, description),
+      image_url = COALESCE(?, image_url),
+      price = COALESCE(?, price),
+      is_active = COALESCE(?, is_active)
+    WHERE id = ?`,
+    [category_id, name, description, image_url, price, is_active, req.params.id],
+    (err) => {
+      if (err) return res.status(500).json({ message: 'Failed to update item' });
+      res.json({ message: 'Item updated' });
+    }
+  );
+});
+
+// DELETE /donate-items/:id — admin: delete item
+app.delete('/donate-items/:id', verifyPermission('donate'), (req, res) => {
+  db.query("DELETE FROM donate_items WHERE id = ?", [req.params.id], (err) => {
+    if (err) return res.status(500).json({ message: 'Failed to delete item' });
+    res.json({ message: 'Item deleted' });
+  });
+});
+
+// ════════════════════════════════════════════════════════════
+// PURCHASE TICKETS ENDPOINTS
+// ════════════════════════════════════════════════════════════
+
+// POST /tickets — authenticated user: create ticket
+app.post('/tickets', verifyToken, (req, res) => {
+  const { item_id, ingame_name, discord_username, quantity } = req.body;
+  if (!item_id) return res.status(400).json({ message: 'Item ID is required' });
+  if (!ingame_name || !ingame_name.trim()) return res.status(400).json({ message: 'Ingame Name is required' });
+  if (!discord_username || !discord_username.trim()) return res.status(400).json({ message: 'Discord Username is required' });
+
+  const qty = Math.max(1, parseInt(quantity) || 1);
+
+  // Verify item exists
+  db.query("SELECT id, name, price FROM donate_items WHERE id = ? AND is_active = 1", [item_id], (err, items) => {
+    if (err || items.length === 0) return res.status(404).json({ message: 'Item not found or inactive' });
+
+    db.query(
+      "INSERT INTO purchase_tickets (user_id, item_id, ingame_name, discord_username, quantity) VALUES (?, ?, ?, ?, ?)",
+      [req.user.id, item_id, ingame_name.trim(), discord_username.trim(), qty],
+      (err2, result) => {
+        if (err2) return res.status(500).json({ message: 'Failed to create ticket' });
+        const ticketId = result.insertId;
+
+        const totalPrice = (parseFloat(items[0].price) * qty).toFixed(2);
+        const autoMsg = `🛒 Purchase Request Details:\n• Ingame Name: ${ingame_name.trim()}\n• Discord Username: ${discord_username.trim()}\n• Item: ${items[0].name}\n• Quantity: ${qty}\n• Total Price: $${totalPrice}`;
+
+        db.query(
+          "INSERT INTO ticket_messages (ticket_id, sender_id, message) VALUES (?, ?, ?)",
+          [ticketId, req.user.id, autoMsg],
+          () => {} // fire and forget
+        );
+
+        // Notify admins via Socket.IO
+        if (global.io) {
+          global.io.to('admin-tickets').emit('new-ticket', { id: ticketId, item: items[0], user_id: req.user.id });
+        }
+
+        res.status(201).json({ message: 'Ticket created', id: ticketId });
+      }
+    );
+  });
+});
+
+// GET /tickets — admin: list all tickets
+app.get('/tickets', verifyPermission('tickets'), (req, res) => {
+  const { status } = req.query;
+  let sql = `SELECT t.*, 
+    u.username as user_name, u.email as user_email,
+    i.name as item_name, i.price as item_price, i.image_url as item_image,
+    a.username as admin_name
+    FROM purchase_tickets t
+    LEFT JOIN users u ON u.id = t.user_id
+    LEFT JOIN donate_items i ON i.id = t.item_id
+    LEFT JOIN users a ON a.id = t.assigned_admin_id`;
+  const params = [];
+  if (status) {
+    sql += ' WHERE t.status = ?';
+    params.push(status);
+  }
+  sql += ' ORDER BY t.created_at DESC';
+  db.query(sql, params, (err, results) => {
+    if (err) return res.status(500).json({ message: 'Failed to fetch tickets' });
+    res.json(results);
+  });
+});
+
+// GET /tickets/my — authenticated user: list own tickets
+app.get('/tickets/my', verifyToken, (req, res) => {
+  db.query(
+    `SELECT t.*, 
+      i.name as item_name, i.price as item_price, i.image_url as item_image,
+      a.username as admin_name
+      FROM purchase_tickets t
+      LEFT JOIN donate_items i ON i.id = t.item_id
+      LEFT JOIN users a ON a.id = t.assigned_admin_id
+      WHERE t.user_id = ?
+      ORDER BY t.created_at DESC`,
+    [req.user.id],
+    (err, results) => {
+      if (err) return res.status(500).json({ message: 'Failed to fetch your tickets' });
+      res.json(results);
+    }
+  );
+});
+
+// GET /tickets/:id — admin or ticket owner
+app.get('/tickets/:id', verifyToken, (req, res) => {
+  db.query(
+    `SELECT t.*, 
+      u.username as user_name, u.email as user_email,
+      i.name as item_name, i.price as item_price, i.image_url as item_image, i.description as item_description,
+      a.username as admin_name
+      FROM purchase_tickets t
+      LEFT JOIN users u ON u.id = t.user_id
+      LEFT JOIN donate_items i ON i.id = t.item_id
+      LEFT JOIN users a ON a.id = t.assigned_admin_id
+      WHERE t.id = ?`,
+    [req.params.id],
+    (err, results) => {
+      if (err || results.length === 0) return res.status(404).json({ message: 'Ticket not found' });
+      const ticket = results[0];
+      // Only ticket owner or admins can view
+      if (ticket.user_id !== req.user.id && req.user.role !== 'admin' && req.user.role !== 'master') {
+        return res.status(403).json({ message: 'Access denied' });
+      }
+      res.json(ticket);
+    }
+  );
+});
+
+// PUT /tickets/:id/claim — admin: self-claim a ticket
+app.put('/tickets/:id/claim', verifyPermission('tickets'), (req, res) => {
+  db.query(
+    "UPDATE purchase_tickets SET status = 'claimed', assigned_admin_id = ? WHERE id = ? AND status = 'open'",
+    [req.user.id, req.params.id],
+    (err, result) => {
+      if (err) return res.status(500).json({ message: 'Failed to claim ticket' });
+      if (result.affectedRows === 0) return res.status(400).json({ message: 'Ticket already claimed or not found' });
+      
+      if (global.io) {
+        global.io.to(`ticket-${req.params.id}`).emit('ticket-updated', { id: req.params.id, status: 'claimed', assigned_admin_id: req.user.id });
+        global.io.to('admin-tickets').emit('ticket-updated', { id: req.params.id, status: 'claimed' });
+      }
+      res.json({ message: 'Ticket claimed' });
+    }
+  );
+});
+
+// PUT /tickets/:id/assign — admin: assign ticket to another admin
+app.put('/tickets/:id/assign', verifyPermission('tickets'), (req, res) => {
+  const { admin_id } = req.body;
+  if (!admin_id) return res.status(400).json({ message: 'Admin ID is required' });
+  db.query(
+    "UPDATE purchase_tickets SET status = 'claimed', assigned_admin_id = ? WHERE id = ?",
+    [admin_id, req.params.id],
+    (err) => {
+      if (err) return res.status(500).json({ message: 'Failed to assign ticket' });
+      if (global.io) {
+        global.io.to(`ticket-${req.params.id}`).emit('ticket-updated', { id: req.params.id, status: 'claimed', assigned_admin_id: admin_id });
+        global.io.to('admin-tickets').emit('ticket-updated', { id: req.params.id, status: 'claimed' });
+      }
+      res.json({ message: 'Ticket assigned' });
+    }
+  );
+});
+
+// PUT /tickets/:id/close — admin or ticket owner: close ticket
+app.put('/tickets/:id/close', verifyToken, (req, res) => {
+  // First check ownership or admin
+  db.query("SELECT user_id FROM purchase_tickets WHERE id = ?", [req.params.id], (err, results) => {
+    if (err || results.length === 0) return res.status(404).json({ message: 'Ticket not found' });
+    if (results[0].user_id !== req.user.id && req.user.role !== 'admin' && req.user.role !== 'master') {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+    db.query("UPDATE purchase_tickets SET status = 'closed' WHERE id = ?", [req.params.id], (err2) => {
+      if (err2) return res.status(500).json({ message: 'Failed to close ticket' });
+      if (global.io) {
+        global.io.to(`ticket-${req.params.id}`).emit('ticket-updated', { id: req.params.id, status: 'closed' });
+        global.io.to('admin-tickets').emit('ticket-updated', { id: req.params.id, status: 'closed' });
+      }
+      res.json({ message: 'Ticket closed' });
+    });
+  });
+});
+
+// DELETE /tickets/:id — admin: delete ticket
+app.delete('/tickets/:id', verifyPermission('tickets'), (req, res) => {
+  db.query("DELETE FROM purchase_tickets WHERE id = ?", [req.params.id], (err, result) => {
+    if (err) return res.status(500).json({ message: 'Failed to delete ticket' });
+    if (result.affectedRows === 0) return res.status(404).json({ message: 'Ticket not found' });
+    if (global.io) {
+      global.io.to(`ticket-${req.params.id}`).emit('ticket-deleted', { id: req.params.id });
+      global.io.to('admin-tickets').emit('ticket-updated', { id: req.params.id });
+    }
+    res.json({ message: 'Ticket deleted successfully' });
+  });
+});
+
+// GET /tickets/:id/messages — get all messages for a ticket
+app.get('/tickets/:id/messages', verifyToken, (req, res) => {
+  // First verify access
+  db.query("SELECT user_id FROM purchase_tickets WHERE id = ?", [req.params.id], (err, tResults) => {
+    if (err || tResults.length === 0) return res.status(404).json({ message: 'Ticket not found' });
+    if (tResults[0].user_id !== req.user.id && req.user.role !== 'admin' && req.user.role !== 'master') {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+    db.query(
+      `SELECT m.*, u.username as sender_name, u.role as sender_role
+       FROM ticket_messages m
+       LEFT JOIN users u ON u.id = m.sender_id
+       WHERE m.ticket_id = ?
+       ORDER BY m.created_at ASC`,
+      [req.params.id],
+      (err2, results) => {
+        if (err2) return res.status(500).json({ message: 'Failed to fetch messages' });
+        res.json(results);
+      }
+    );
+  });
+});
+
+// POST /tickets/:id/messages — add message
+app.post('/tickets/:id/messages', verifyToken, (req, res) => {
+  const { message } = req.body;
+  if (!message || !message.trim()) return res.status(400).json({ message: 'Message is required' });
+  
+  // Verify access
+  db.query("SELECT user_id, status FROM purchase_tickets WHERE id = ?", [req.params.id], (err, tResults) => {
+    if (err || tResults.length === 0) return res.status(404).json({ message: 'Ticket not found' });
+    if (tResults[0].user_id !== req.user.id && req.user.role !== 'admin' && req.user.role !== 'master') {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+    if (tResults[0].status === 'closed') {
+      return res.status(400).json({ message: 'Cannot send messages on a closed ticket' });
+    }
+    
+    db.query(
+      "INSERT INTO ticket_messages (ticket_id, sender_id, message) VALUES (?, ?, ?)",
+      [req.params.id, req.user.id, message.trim()],
+      (err2, result) => {
+        if (err2) return res.status(500).json({ message: 'Failed to send message' });
+        
+        const msgData = {
+          id: result.insertId,
+          ticket_id: parseInt(req.params.id),
+          sender_id: req.user.id,
+          sender_name: req.user.username || 'Unknown',
+          sender_role: req.user.role,
+          message: message.trim(),
+          created_at: new Date().toISOString()
+        };
+        
+        // We need the username — fetch it
+        db.query("SELECT username, role FROM users WHERE id = ?", [req.user.id], (err3, uResults) => {
+          if (!err3 && uResults.length > 0) {
+            msgData.sender_name = uResults[0].username;
+            msgData.sender_role = uResults[0].role;
+          }
+          // Broadcast via Socket.IO
+          if (global.io) {
+            global.io.to(`ticket-${req.params.id}`).emit('new-message', msgData);
+          }
+          res.status(201).json(msgData);
+        });
+      }
+    );
+  });
+});
+
+// GET /admins — list admin/master users (for ticket assignment dropdown)
+app.get('/admins', verifyPermission('tickets'), (req, res) => {
+  db.query(
+    "SELECT id, username, email, role FROM users WHERE role IN ('admin', 'master') ORDER BY username ASC",
+    (err, results) => {
+      if (err) return res.status(500).json({ message: 'Failed to fetch admins' });
+      res.json(results);
+    }
+  );
+});
+
 // ─── GET / ────────────────────────────────────────────────
 app.get('/', (req, res) => res.send('Server is running and working perfectly!'));
 
-app.listen(5000, () => console.log("Server is running on port 5000"));
+// SOCKET.IO SETUP
+const io = new Server(server, {
+  cors: {
+    origin: allowedOrigins,
+    credentials: true
+  }
+});
+global.io = io;
+
+// Authenticate socket connections via JWT
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token;
+  if (!token) return next(new Error('Authentication required'));
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    socket.user = decoded;
+    next();
+  } catch {
+    next(new Error('Invalid token'));
+  }
+});
+
+io.on('connection', (socket) => {
+  console.log(`Socket connected: ${socket.user.id} (${socket.user.role})`);
+  
+  // Admin joins the admin-tickets room for real-time notifications
+  if (socket.user.role === 'admin' || socket.user.role === 'master') {
+    socket.join('admin-tickets');
+  }
+  
+  // Join a specific ticket room
+  socket.on('join-ticket', (ticketId) => {
+    // Verify access before joining
+    db.query("SELECT user_id FROM purchase_tickets WHERE id = ?", [ticketId], (err, results) => {
+      if (err || results.length === 0) return;
+      if (results[0].user_id === socket.user.id || socket.user.role === 'admin' || socket.user.role === 'master') {
+        socket.join(`ticket-${ticketId}`);
+        console.log(`User ${socket.user.id} joined ticket-${ticketId}`);
+      }
+    });
+  });
+  
+  // Leave a ticket room
+  socket.on('leave-ticket', (ticketId) => {
+    socket.leave(`ticket-${ticketId}`);
+  });
+  
+  socket.on('disconnect', () => {
+    console.log(`Socket disconnected: ${socket.user.id}`);
+  });
+});
+
+server.listen(5000, () => console.log("Server is running on port 5000"));
