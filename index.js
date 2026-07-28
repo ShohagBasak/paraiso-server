@@ -184,20 +184,28 @@ function verifyToken(req, res, next) {
 // ─── verifyAdmin Middleware ────────────────────────────────
 function verifyAdmin(req, res, next) {
   verifyToken(req, res, () => {
-    if (req.user?.role !== 'admin' && req.user?.role !== 'master') {
-      return res.status(403).json({ message: 'Admin access required' });
-    }
-    next();
+    db.query("SELECT role FROM users WHERE id = ?", [req.user.id], (err, userRows) => {
+      const currentRole = (userRows && userRows.length > 0) ? userRows[0].role : req.user.role;
+      if (currentRole !== 'admin' && currentRole !== 'master') {
+        return res.status(403).json({ message: 'Admin access required' });
+      }
+      req.user.role = currentRole;
+      next();
+    });
   });
 }
 
 // ─── verifyMaster Middleware ───────────────────────────────
 function verifyMaster(req, res, next) {
   verifyToken(req, res, () => {
-    if (req.user?.role !== 'master') {
-      return res.status(403).json({ message: 'Master Admin access required' });
-    }
-    next();
+    db.query("SELECT role FROM users WHERE id = ?", [req.user.id], (err, userRows) => {
+      const currentRole = (userRows && userRows.length > 0) ? userRows[0].role : req.user.role;
+      if (currentRole !== 'master') {
+        return res.status(403).json({ message: 'Master Admin access required' });
+      }
+      req.user.role = currentRole;
+      next();
+    });
   });
 }
 
@@ -205,25 +213,36 @@ function verifyMaster(req, res, next) {
 function verifyPermission(permissionKey) {
   return (req, res, next) => {
     verifyToken(req, res, () => {
-      if (req.user?.role === 'master') {
-        return next();
-      }
-      if (req.user?.role === 'admin') {
-        db.query(
-          "SELECT 1 FROM admin_permissions WHERE user_id = ? AND permission_key = ?",
-          [req.user.id, permissionKey],
-          (err, results) => {
-            if (!err && results && results.length > 0) {
-              return next();
-            }
-            return res.status(403).json({ 
-              message: `Access denied. You do not have permission to manage this section (${permissionKey}).` 
-            });
+      db.query("SELECT role FROM users WHERE id = ?", [req.user.id], (err, userRows) => {
+        if (err || !userRows || userRows.length === 0) {
+          return res.status(403).json({ message: 'Access denied' });
+        }
+        const currentRole = userRows[0].role;
+        req.user.role = currentRole;
+
+        if (currentRole === 'master') {
+          return next();
+        }
+        if (currentRole === 'admin') {
+          if (permissionKey === 'tickets') {
+            return next(); // All Admins have access to Tickets
           }
-        );
-      } else {
-        return res.status(403).json({ message: 'Admin access required' });
-      }
+          db.query(
+            "SELECT 1 FROM admin_permissions WHERE user_id = ? AND permission_key = ?",
+            [req.user.id, permissionKey],
+            (err2, results) => {
+              if (!err2 && results && results.length > 0) {
+                return next();
+              }
+              return res.status(403).json({ 
+                message: `Access denied. You do not have permission to manage this section (${permissionKey}).` 
+              });
+            }
+          );
+        } else {
+          return res.status(403).json({ message: 'Admin access required' });
+        }
+      });
     });
   };
 }
@@ -2784,26 +2803,53 @@ app.post('/tickets', verifyToken, (req, res) => {
   });
 });
 
-// GET /tickets — admin: list all tickets
-app.get('/tickets', verifyPermission('tickets'), (req, res) => {
+// GET /tickets — list tickets (master & global permission admins get all, assigned admins get assigned tickets)
+app.get('/tickets', verifyToken, (req, res) => {
   const { status } = req.query;
-  let sql = `SELECT t.*, 
-    u.username as user_name, u.email as user_email,
-    i.name as item_name, i.price as item_price, i.image_url as item_image,
-    a.username as admin_name
-    FROM purchase_tickets t
-    LEFT JOIN users u ON u.id = t.user_id
-    LEFT JOIN donate_items i ON i.id = t.item_id
-    LEFT JOIN users a ON a.id = t.assigned_admin_id`;
-  const params = [];
-  if (status) {
-    sql += ' WHERE t.status = ?';
-    params.push(status);
-  }
-  sql += ' ORDER BY t.created_at DESC';
-  db.query(sql, params, (err, results) => {
-    if (err) return res.status(500).json({ message: 'Failed to fetch tickets' });
-    res.json(results);
+
+  db.query("SELECT role FROM users WHERE id = ?", [req.user.id], (err, userRows) => {
+    if (err || !userRows || userRows.length === 0) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+    const userRole = userRows[0].role;
+    req.user.role = userRole;
+
+    db.query("SELECT 1 FROM admin_permissions WHERE user_id = ? AND permission_key = 'tickets'", [req.user.id], (err2, permRows) => {
+      const hasGlobalPermission = userRole === 'master' || (!err2 && permRows && permRows.length > 0);
+
+      let sql = `SELECT t.*, 
+        u.username as user_name, u.email as user_email,
+        i.name as item_name, i.price as item_price, i.image_url as item_image,
+        a.username as admin_name
+        FROM purchase_tickets t
+        LEFT JOIN users u ON u.id = t.user_id
+        LEFT JOIN donate_items i ON i.id = t.item_id
+        LEFT JOIN users a ON a.id = t.assigned_admin_id`;
+      
+      const conditions = [];
+      const params = [];
+
+      if (!hasGlobalPermission) {
+        // Scoped Admin/User: only see tickets specifically assigned to them
+        conditions.push('t.assigned_admin_id = ?');
+        params.push(req.user.id);
+      }
+
+      if (status) {
+        conditions.push('t.status = ?');
+        params.push(status);
+      }
+
+      if (conditions.length > 0) {
+        sql += ' WHERE ' + conditions.join(' AND ');
+      }
+
+      sql += ' ORDER BY t.created_at DESC';
+      db.query(sql, params, (err3, results) => {
+        if (err3) return res.status(500).json({ message: 'Failed to fetch tickets' });
+        res.json(results);
+      });
+    });
   });
 });
 
@@ -2826,7 +2872,7 @@ app.get('/tickets/my', verifyToken, (req, res) => {
   );
 });
 
-// GET /tickets/:id — admin or ticket owner
+// GET /tickets/:id — admin or ticket owner or assigned admin
 app.get('/tickets/:id', verifyToken, (req, res) => {
   db.query(
     `SELECT t.*, 
@@ -2842,17 +2888,26 @@ app.get('/tickets/:id', verifyToken, (req, res) => {
     (err, results) => {
       if (err || results.length === 0) return res.status(404).json({ message: 'Ticket not found' });
       const ticket = results[0];
-      // Only ticket owner or admins can view
-      if (ticket.user_id !== req.user.id && req.user.role !== 'admin' && req.user.role !== 'master') {
-        return res.status(403).json({ message: 'Access denied' });
+
+      // Master admin, ticket owner, or assigned admin can view
+      if (req.user.role === 'master' || ticket.user_id === req.user.id || ticket.assigned_admin_id === req.user.id) {
+        return res.json(ticket);
       }
-      res.json(ticket);
+
+      // Check if admin has global tickets permission
+      db.query("SELECT 1 FROM admin_permissions WHERE user_id = ? AND permission_key = 'tickets'", [req.user.id], (err2, permRows) => {
+        const hasGlobalPermission = !err2 && permRows && permRows.length > 0;
+        if (hasGlobalPermission) {
+          return res.json(ticket);
+        }
+        return res.status(403).json({ message: 'Access denied. You can only view tickets assigned to you.' });
+      });
     }
   );
 });
 
 // PUT /tickets/:id/claim — admin: self-claim a ticket
-app.put('/tickets/:id/claim', verifyPermission('tickets'), (req, res) => {
+app.put('/tickets/:id/claim', verifyToken, (req, res) => {
   db.query(
     "UPDATE purchase_tickets SET status = 'claimed', assigned_admin_id = ? WHERE id = ? AND status = 'open'",
     [req.user.id, req.params.id],
@@ -2869,8 +2924,8 @@ app.put('/tickets/:id/claim', verifyPermission('tickets'), (req, res) => {
   );
 });
 
-// PUT /tickets/:id/assign — admin: assign ticket to another admin
-app.put('/tickets/:id/assign', verifyPermission('tickets'), (req, res) => {
+// PUT /tickets/:id/assign — assign ticket to another admin
+app.put('/tickets/:id/assign', verifyToken, (req, res) => {
   const { admin_id } = req.body;
   if (!admin_id) return res.status(400).json({ message: 'Admin ID is required' });
   db.query(
@@ -2878,6 +2933,8 @@ app.put('/tickets/:id/assign', verifyPermission('tickets'), (req, res) => {
     [admin_id, req.params.id],
     (err) => {
       if (err) return res.status(500).json({ message: 'Failed to assign ticket' });
+      db.query("UPDATE users SET role = 'admin' WHERE id = ? AND role = 'user'", [admin_id], () => {});
+
       if (global.io) {
         global.io.to(`ticket-${req.params.id}`).emit('ticket-updated', { id: req.params.id, status: 'claimed', assigned_admin_id: admin_id });
         global.io.to('admin-tickets').emit('ticket-updated', { id: req.params.id, status: 'claimed' });
@@ -2906,16 +2963,23 @@ app.put('/tickets/:id/close', verifyToken, (req, res) => {
   });
 });
 
-// DELETE /tickets/:id — admin: delete ticket
-app.delete('/tickets/:id', verifyPermission('tickets'), (req, res) => {
-  db.query("DELETE FROM purchase_tickets WHERE id = ?", [req.params.id], (err, result) => {
-    if (err) return res.status(500).json({ message: 'Failed to delete ticket' });
-    if (result.affectedRows === 0) return res.status(404).json({ message: 'Ticket not found' });
-    if (global.io) {
-      global.io.to(`ticket-${req.params.id}`).emit('ticket-deleted', { id: req.params.id });
-      global.io.to('admin-tickets').emit('ticket-updated', { id: req.params.id });
+// DELETE /tickets/:id — admin or master admin: delete ticket
+app.delete('/tickets/:id', verifyToken, (req, res) => {
+  db.query("SELECT role FROM users WHERE id = ?", [req.user.id], (err, userRes) => {
+    const dbRole = userRes && userRes.length > 0 ? userRes[0].role : req.user.role;
+    if (dbRole !== 'admin' && dbRole !== 'master') {
+      return res.status(403).json({ message: 'Access denied. Only admins can delete tickets.' });
     }
-    res.json({ message: 'Ticket deleted successfully' });
+
+    db.query("DELETE FROM purchase_tickets WHERE id = ?", [req.params.id], (err2, result) => {
+      if (err2) return res.status(500).json({ message: 'Failed to delete ticket' });
+      if (result.affectedRows === 0) return res.status(404).json({ message: 'Ticket not found' });
+      if (global.io) {
+        global.io.to(`ticket-${req.params.id}`).emit('ticket-deleted', { id: req.params.id });
+        global.io.to('admin-tickets').emit('ticket-updated', { id: req.params.id });
+      }
+      res.json({ message: 'Ticket deleted successfully' });
+    });
   });
 });
 
