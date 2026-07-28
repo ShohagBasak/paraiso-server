@@ -9,9 +9,38 @@ require('dotenv').config();
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const { Server } = require('socket.io');
+const nodemailer = require('nodemailer');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 const server = http.createServer(app);
+
+// ─── Rate Limiter for Registration & OTP ───
+const registerLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // Limit each IP to 5 requests per 15 minutes
+  message: { message: "Too many registration attempts from this IP. Please try again after 15 minutes." },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// ─── Nodemailer Transporter ───
+const getTransporter = () => {
+  if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+    const cleanUser = process.env.EMAIL_USER.trim();
+    const cleanPass = process.env.EMAIL_PASS.replace(/\s+/g, '');
+    return nodemailer.createTransport({
+      host: 'smtp.gmail.com',
+      port: 465,
+      secure: true,
+      auth: {
+        user: cleanUser,
+        pass: cleanPass
+      }
+    });
+  }
+  return null;
+};
 
 const allowedOrigins = [
   'http://localhost:5173',
@@ -87,6 +116,21 @@ db.query(`
 `, (err) => {
   if (err) console.error("Error creating allowed_registration_emails table:", err);
   else console.log("Verified allowed_registration_emails table exists.");
+});
+
+// ─── Initialize Email OTPs Table ─────────────────────────────
+db.query(`
+  CREATE TABLE IF NOT EXISTS email_otps (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    email VARCHAR(255) NOT NULL,
+    otp VARCHAR(10) NOT NULL,
+    expires_at DATETIME NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX (email)
+  )
+`, (err) => {
+  if (err) console.error("Error creating email_otps table:", err);
+  else console.log("Verified email_otps table exists.");
 });
 
 // ─── Initialize Donate Categories Table ───────────────────
@@ -393,36 +437,137 @@ app.delete('/allowed-emails/:id', verifyMaster, (req, res) => {
   );
 });
 
-// ─── POST /public-register (Public — community user registration) ───
-app.post('/public-register', async (req, res) => {
+// ─── POST /send-otp (Send 6-digit registration OTP to email) ───
+app.post('/send-otp', registerLimiter, async (req, res) => {
   try {
-    const { username, email, password } = req.body;
-    if (!username || !email || !password) {
-      return res.status(400).json({ message: "Username, email, and password are required." });
+    const { email } = req.body;
+    if (!email || !email.includes('@')) {
+      return res.status(400).json({ message: 'Valid email address is required.' });
+    }
+    const cleanEmail = email.toLowerCase().trim();
+
+    // Check if account already exists
+    db.query("SELECT id FROM users WHERE email = ?", [cleanEmail], (err, results) => {
+      if (err) return res.status(500).json({ message: 'Database error.' });
+      if (results && results.length > 0) {
+        return res.status(409).json({ message: 'An account with this email already exists.' });
+      }
+
+      // Generate 6-digit OTP
+      const otp = Math.floor(100000 + Math.random() * 900000).toString();
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+      db.query("DELETE FROM email_otps WHERE email = ?", [cleanEmail], () => {
+        db.query("INSERT INTO email_otps (email, otp, expires_at) VALUES (?, ?, ?)", [cleanEmail, otp, expiresAt], async (insertErr) => {
+          if (insertErr) return res.status(500).json({ message: 'Failed to generate OTP.' });
+
+          const transporter = getTransporter();
+          if (transporter) {
+            try {
+              await transporter.sendMail({
+                from: `"Paraiso Gaming" <${process.env.EMAIL_USER}>`,
+                to: cleanEmail,
+                subject: 'Your Paraiso Gaming Registration OTP Code',
+                html: `
+                  <div style="font-family: Arial, sans-serif; background: #080d13; color: #fff; padding: 30px; border-radius: 16px; max-width: 480px; margin: 0 auto; border: 1px solid #1e293b;">
+                    <h2 style="color: #06b6d4; text-transform: uppercase; margin-bottom: 8px;">Paraiso Gaming</h2>
+                    <p style="color: #94a3b8; font-size: 14px;">Use the following OTP code to complete your registration:</p>
+                    <div style="background: #0d1117; padding: 18px; border-radius: 12px; text-align: center; margin: 20px 0; border: 1px solid #334155;">
+                      <span style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #38bdf8;">${otp}</span>
+                    </div>
+                    <p style="color: #64748b; font-size: 12px;">This code will expire in 10 minutes. If you did not request this code, please ignore this email.</p>
+                  </div>
+                `
+              });
+              console.log(`[OTP SENT] Code ${otp} sent to ${cleanEmail}`);
+              res.json({ message: 'OTP code sent to your email.' });
+            } catch (mailErr) {
+              console.error("Failed to send email via SMTP:", mailErr);
+              res.json({ message: 'OTP generated. Please check your inbox.', devOtp: otp });
+            }
+          } else {
+            console.log(`[DEV MODE - OTP GENERATED] Email: ${cleanEmail} | OTP: ${otp}`);
+            res.json({ 
+              message: 'OTP generated! (Set EMAIL_USER & EMAIL_PASS in .env for live email delivery)', 
+              devOtp: otp 
+            });
+          }
+        });
+      });
+    });
+  } catch (err) {
+    console.error("SEND OTP ERROR:", err);
+    res.status(500).json({ message: 'Server error sending OTP.' });
+  }
+});
+
+// ─── POST /public-register (Public — community user registration with OTP & Turnstile) ───
+app.post('/public-register', registerLimiter, async (req, res) => {
+  try {
+    const { username, email, password, otp, turnstileToken } = req.body;
+    if (!username || !email || !password || !otp) {
+      return res.status(400).json({ message: "Username, email, password, and OTP code are required." });
     }
     if (password.length < 6) {
       return res.status(400).json({ message: "Password must be at least 6 characters." });
     }
 
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const sql = `INSERT INTO users (username, email, password_hash, role) VALUES (?, ?, ?, 'user')`;
+    const cleanEmail = email.toLowerCase().trim();
 
-    db.query(sql, [username, email.toLowerCase().trim(), hashedPassword], (err, result) => {
-      if (err) {
-        if (err.code === 'ER_DUP_ENTRY') {
-          return res.status(409).json({ message: "An account with this email already exists." });
+    // ── Turnstile Verification (if secret key configured) ──
+    if (process.env.TURNSTILE_SECRET_KEY && turnstileToken) {
+      try {
+        const verifyRes = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({
+            secret: process.env.TURNSTILE_SECRET_KEY,
+            response: turnstileToken
+          })
+        });
+        const verifyData = await verifyRes.json();
+        if (!verifyData.success) {
+          return res.status(400).json({ message: "Turnstile captcha verification failed. Please try again." });
         }
-        return res.status(500).json({ message: "Registration failed. Please try again." });
+      } catch (tsErr) {
+        console.error("Turnstile error:", tsErr);
       }
-      const newUserId = result.insertId;
-      const token = jwt.sign({ id: newUserId, email: email.toLowerCase().trim(), role: 'user' }, process.env.JWT_SECRET, { expiresIn: '7d' });
-      res.cookie('token', token, cookieOptions);
-      res.status(201).json({
-        message: 'Registration successful!',
-        token,
-        user: { id: newUserId, username, email: email.toLowerCase().trim(), role: 'user', permissions: [] }
-      });
-    });
+    }
+
+    // ── Verify OTP ──
+    db.query(
+      "SELECT * FROM email_otps WHERE email = ? AND otp = ? AND expires_at > NOW() ORDER BY id DESC LIMIT 1",
+      [cleanEmail, otp.trim()],
+      async (otpErr, otpResults) => {
+        if (otpErr || !otpResults || otpResults.length === 0) {
+          return res.status(400).json({ message: "Invalid or expired OTP code. Please request a new code." });
+        }
+
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const sql = `INSERT INTO users (username, email, password_hash, role) VALUES (?, ?, ?, 'user')`;
+
+        db.query(sql, [username.trim(), cleanEmail, hashedPassword], (err, result) => {
+          if (err) {
+            if (err.code === 'ER_DUP_ENTRY') {
+              return res.status(409).json({ message: "An account with this email already exists." });
+            }
+            return res.status(500).json({ message: "Registration failed. Please try again." });
+          }
+          const newUserId = result.insertId;
+
+          // Clear used OTP
+          db.query("DELETE FROM email_otps WHERE email = ?", [cleanEmail], () => {});
+
+          const token = jwt.sign({ id: newUserId, email: cleanEmail, role: 'user' }, process.env.JWT_SECRET, { expiresIn: '7d' });
+          res.cookie('token', token, cookieOptions);
+          res.status(201).json({
+            message: 'Registration successful!',
+            token,
+            user: { id: newUserId, username: username.trim(), email: cleanEmail, role: 'user', permissions: [] }
+          });
+        });
+      }
+    );
   } catch (err) {
     console.error("PUBLIC REGISTER CRASH:", err);
     res.status(500).json({ message: err.message });
@@ -2944,21 +3089,37 @@ app.put('/tickets/:id/assign', verifyToken, (req, res) => {
   );
 });
 
-// PUT /tickets/:id/close — admin or ticket owner: close ticket
-app.put('/tickets/:id/close', verifyToken, (req, res) => {
-  // First check ownership or admin
-  db.query("SELECT user_id FROM purchase_tickets WHERE id = ?", [req.params.id], (err, results) => {
+// PUT /tickets/:id/close — admin only: close ticket
+app.put('/tickets/:id/close', verifyToken, verifyPermission('tickets'), (req, res) => {
+  db.query("UPDATE purchase_tickets SET status = 'closed' WHERE id = ?", [req.params.id], (err2) => {
+    if (err2) return res.status(500).json({ message: 'Failed to close ticket' });
+    if (global.io) {
+      global.io.to(`ticket-${req.params.id}`).emit('ticket-updated', { id: req.params.id, status: 'closed' });
+      global.io.to('admin-tickets').emit('ticket-updated', { id: req.params.id, status: 'closed' });
+    }
+    res.json({ message: 'Ticket closed' });
+  });
+});
+
+// PUT /tickets/:id/reopen — ticket owner or admin: reopen ticket
+app.put('/tickets/:id/reopen', verifyToken, (req, res) => {
+  db.query("SELECT user_id, assigned_admin_id FROM purchase_tickets WHERE id = ?", [req.params.id], (err, results) => {
     if (err || results.length === 0) return res.status(404).json({ message: 'Ticket not found' });
-    if (results[0].user_id !== req.user.id && req.user.role !== 'admin' && req.user.role !== 'master') {
+    const isOwner = results[0].user_id === req.user.id;
+    const isAdmin = req.user.role === 'admin' || req.user.role === 'master' || (req.user.permissions && req.user.permissions.includes('tickets'));
+
+    if (!isOwner && !isAdmin) {
       return res.status(403).json({ message: 'Access denied' });
     }
-    db.query("UPDATE purchase_tickets SET status = 'closed' WHERE id = ?", [req.params.id], (err2) => {
-      if (err2) return res.status(500).json({ message: 'Failed to close ticket' });
+
+    const newStatus = results[0].assigned_admin_id ? 'claimed' : 'open';
+    db.query("UPDATE purchase_tickets SET status = ? WHERE id = ?", [newStatus, req.params.id], (err2) => {
+      if (err2) return res.status(500).json({ message: 'Failed to reopen ticket' });
       if (global.io) {
-        global.io.to(`ticket-${req.params.id}`).emit('ticket-updated', { id: req.params.id, status: 'closed' });
-        global.io.to('admin-tickets').emit('ticket-updated', { id: req.params.id, status: 'closed' });
+        global.io.to(`ticket-${req.params.id}`).emit('ticket-updated', { id: req.params.id, status: newStatus });
+        global.io.to('admin-tickets').emit('ticket-updated', { id: req.params.id, status: newStatus });
       }
-      res.json({ message: 'Ticket closed' });
+      res.json({ message: 'Ticket reopened', status: newStatus });
     });
   });
 });
