@@ -570,6 +570,74 @@ const sendEmailHelper = async ({ to, subject, description, otp, expiryMinutes = 
   }
 };
 
+// ─── POST /send-otp (Send 6-digit registration OTP to email) ───
+app.post('/send-otp', registerLimiter, async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email || !email.includes('@')) {
+      return res.status(400).json({ message: 'Valid email address is required.' });
+    }
+    const cleanEmail = email.toLowerCase().trim();
+
+    const existingUsers = await new Promise((resolve, reject) => {
+      db.query("SELECT id FROM users WHERE email = ?", [cleanEmail], (err, rows) => {
+        if (err) reject(err);
+        else resolve(rows || []);
+      });
+    });
+
+    if (existingUsers.length > 0) {
+      return res.status(409).json({ message: 'An account with this email already exists.' });
+    }
+
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+    await new Promise((resolve) => {
+      db.query("DELETE FROM email_otps WHERE email = ?", [cleanEmail], () => resolve());
+    });
+
+    await new Promise((resolve, reject) => {
+      db.query(
+        "INSERT INTO email_otps (email, otp, expires_at, type) VALUES (?, ?, ?, 'registration')",
+        [cleanEmail, otp, expiresAt],
+        (err) => {
+          if (err) {
+            db.query("INSERT INTO email_otps (email, otp, expires_at) VALUES (?, ?, ?)", [cleanEmail, otp, expiresAt], (err2) => {
+              if (err2) reject(err2);
+              else resolve();
+            });
+          } else {
+            resolve();
+          }
+        }
+      );
+    });
+
+    if (process.env.DEV_MODE === 'true') {
+      console.log(`[DEV_MODE] Registration OTP for ${cleanEmail} is: ${otp}`);
+      return res.json({ message: `[DEV_MODE Active] OTP code is: ${otp}`, devOtp: otp });
+    }
+
+    const emailSent = await sendEmailHelper({
+      to: cleanEmail,
+      subject: 'Your Paraiso Gaming Registration OTP Code',
+      description: 'Use the following OTP code to complete your registration:',
+      otp: otp,
+      expiryMinutes: 10
+    });
+
+    if (emailSent.success) {
+      res.json({ message: 'OTP code sent to your email.' });
+    } else {
+      res.status(500).json({ message: emailSent.error || 'Failed to send OTP email.' });
+    }
+  } catch (err) {
+    console.error("SEND OTP ERROR:", err);
+    res.status(500).json({ message: err.message || 'Server error sending OTP.' });
+  }
+});
+
 // ─── POST /forgot-password (Request 6-digit password reset OTP) ───
 app.post('/forgot-password', registerLimiter, async (req, res) => {
   try {
