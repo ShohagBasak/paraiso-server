@@ -3200,14 +3200,13 @@ db.query("SHOW COLUMNS FROM email_otps LIKE 'type'", (err, rows) => {
 
 // POST /donate-items — admin: create item
 app.post('/donate-items', verifyPermission('donate'), (req, res) => {
-  const { category_id, name, description, image_url, price, renewal_price } = req.body;
+  const { category_id, name, description, image_url, price } = req.body;
   if (!category_id || !name) return res.status(400).json({ message: 'Category and name are required' });
   db.query("SELECT MAX(sort_order) as maxOrder FROM donate_items", (err, orderResult) => {
     const nextOrder = (orderResult && orderResult[0]?.maxOrder !== null) ? orderResult[0].maxOrder + 1 : 0;
-    const renewalVal = (renewal_price !== undefined && renewal_price !== '' && renewal_price !== null) ? parseFloat(renewal_price) : null;
     db.query(
-      "INSERT INTO donate_items (category_id, name, description, image_url, price, renewal_price, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      [category_id, name, description || '', image_url || '', price || 0, renewalVal, nextOrder],
+      "INSERT INTO donate_items (category_id, name, description, image_url, price, sort_order) VALUES (?, ?, ?, ?, ?, ?)",
+      [category_id, name, description || '', image_url || '', price || 0, nextOrder],
       (err2, result) => {
         if (err2) return res.status(500).json({ message: 'Failed to create item' });
         res.status(201).json({ message: 'Item created', id: result.insertId });
@@ -3218,8 +3217,7 @@ app.post('/donate-items', verifyPermission('donate'), (req, res) => {
 
 // PUT /donate-items/:id — admin: update item
 app.put('/donate-items/:id', verifyPermission('donate'), (req, res) => {
-  const { category_id, name, description, image_url, price, renewal_price, is_active } = req.body;
-  const renewalVal = (renewal_price !== undefined && renewal_price !== '' && renewal_price !== null) ? parseFloat(renewal_price) : null;
+  const { category_id, name, description, image_url, price, is_active } = req.body;
   db.query(
     `UPDATE donate_items SET 
       category_id = COALESCE(?, category_id),
@@ -3227,10 +3225,9 @@ app.put('/donate-items/:id', verifyPermission('donate'), (req, res) => {
       description = COALESCE(?, description),
       image_url = COALESCE(?, image_url),
       price = COALESCE(?, price),
-      renewal_price = ?,
       is_active = COALESCE(?, is_active)
     WHERE id = ?`,
-    [category_id, name, description, image_url, price, renewalVal, is_active, req.params.id],
+    [category_id, name, description, image_url, price, is_active, req.params.id],
     (err) => {
       if (err) return res.status(500).json({ message: 'Failed to update item' });
       res.json({ message: 'Item updated' });
@@ -3268,34 +3265,29 @@ app.put('/donate-items-reorder', verifyPermission('donate'), (req, res) => {
 
 // POST /tickets — authenticated user: create ticket
 app.post('/tickets', verifyToken, (req, res) => {
-  const { item_id, ingame_name, discord_username, quantity, order_type } = req.body;
+  const { item_id, ingame_name, discord_username, quantity } = req.body;
   if (!item_id) return res.status(400).json({ message: 'Item ID is required' });
   if (!ingame_name || !ingame_name.trim()) return res.status(400).json({ message: 'Ingame Name is required' });
   if (!discord_username || !discord_username.trim()) return res.status(400).json({ message: 'Discord Username is required' });
 
   const qty = Math.max(1, parseInt(quantity) || 1);
-  const isRenewal = order_type === 'renewal';
 
   // Verify item exists
-  db.query("SELECT id, name, price, renewal_price FROM donate_items WHERE id = ? AND is_active = 1", [item_id], (err, items) => {
+  db.query("SELECT id, name, price FROM donate_items WHERE id = ? AND is_active = 1", [item_id], (err, items) => {
     if (err || items.length === 0) return res.status(404).json({ message: 'Item not found or inactive' });
 
     const item = items[0];
-    const unitPrice = (isRenewal && item.renewal_price !== null && parseFloat(item.renewal_price) > 0)
-      ? parseFloat(item.renewal_price)
-      : parseFloat(item.price);
-
+    const unitPrice = parseFloat(item.price);
     const totalPrice = (unitPrice * qty).toFixed(2);
-    const orderTypeLabel = isRenewal ? 'Renewal Order' : 'New Purchase (First Time)';
 
     db.query(
-      "INSERT INTO purchase_tickets (user_id, item_id, ingame_name, discord_username, quantity, order_type) VALUES (?, ?, ?, ?, ?, ?)",
-      [req.user.id, item_id, ingame_name.trim(), discord_username.trim(), qty, isRenewal ? 'renewal' : 'new'],
+      "INSERT INTO purchase_tickets (user_id, item_id, ingame_name, discord_username, quantity) VALUES (?, ?, ?, ?, ?)",
+      [req.user.id, item_id, ingame_name.trim(), discord_username.trim(), qty],
       (err2, result) => {
         if (err2) return res.status(500).json({ message: 'Failed to create ticket' });
         const ticketId = result.insertId;
 
-        const autoMsg = `🛒 Purchase Request Details:\n• Ingame Name: ${ingame_name.trim()}\n• Discord Username: ${discord_username.trim()}\n• Item: ${item.name}\n• Order Type: ${orderTypeLabel}\n• Unit Price: $${unitPrice.toFixed(2)}\n• Quantity: ${qty}\n• Total Price: $${totalPrice}`;
+        const autoMsg = `🛒 Purchase Request Details:\n• Ingame Name: ${ingame_name.trim()}\n• Discord Username: ${discord_username.trim()}\n• Item: ${item.name}\n• Unit Price: $${unitPrice.toFixed(2)}\n• Quantity: ${qty}\n• Total Price: $${totalPrice}`;
 
         db.query(
           "INSERT INTO ticket_messages (ticket_id, sender_id, message) VALUES (?, ?, ?)",
