@@ -34,6 +34,7 @@ const getTransporter = () => {
       host: 'smtp.gmail.com',
       port: 465,
       secure: true,
+      family: 4, // Force IPv4
       auth: {
         user: cleanUser,
         pass: cleanPass
