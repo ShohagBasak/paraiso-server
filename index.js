@@ -11,6 +11,11 @@ const jwt = require('jsonwebtoken');
 const { Server } = require('socket.io');
 const nodemailer = require('nodemailer');
 const rateLimit = require('express-rate-limit');
+const dns = require('dns');
+
+if (dns.setDefaultResultOrder) {
+  dns.setDefaultResultOrder('ipv4first');
+}
 
 const app = express();
 app.set('trust proxy', 1);
