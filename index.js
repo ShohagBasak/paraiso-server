@@ -465,6 +465,86 @@ app.post('/send-otp', registerLimiter, async (req, res) => {
         db.query("INSERT INTO email_otps (email, otp, expires_at) VALUES (?, ?, ?)", [cleanEmail, otp, expiresAt], async (insertErr) => {
           if (insertErr) return res.status(500).json({ message: 'Failed to generate OTP.' });
 
+          // ─── OPTION 0: Developer / Test Bypass Mode ───
+          if (process.env.DEV_MODE === 'true') {
+            console.log(`[DEV_MODE] Bypass sending email. Registration OTP code for ${cleanEmail} is: ${otp}`);
+            return res.json({ message: `[DEV_MODE Active] OTP code is: ${otp}`, devOtp: otp });
+          }
+
+          // ─── OPTION A: Brevo HTTP API (Recommended for free tier) ───
+          if (process.env.BREVO_API_KEY) {
+            try {
+              const brevoRes = await fetch('https://api.brevo.com/v3/smtp/email', {
+                method: 'POST',
+                headers: {
+                  'accept': 'application/json',
+                  'api-key': process.env.BREVO_API_KEY.trim(),
+                  'content-type': 'application/json'
+                },
+                body: JSON.stringify({
+                  sender: { name: "Paraiso Gaming", email: process.env.EMAIL_USER || "noreply@paraisogaming.com" },
+                  to: [{ email: cleanEmail }],
+                  subject: 'Your Paraiso Gaming Registration OTP Code',
+                  htmlContent: `
+                    <div style="font-family: Arial, sans-serif; background: #080d13; color: #fff; padding: 30px; border-radius: 16px; max-width: 480px; margin: 0 auto; border: 1px solid #1e293b;">
+                      <h2 style="color: #06b6d4; text-transform: uppercase; margin-bottom: 8px;">Paraiso Gaming</h2>
+                      <p style="color: #94a3b8; font-size: 14px;">Use the following OTP code to complete your registration:</p>
+                      <div style="background: #0d1117; padding: 18px; border-radius: 12px; text-align: center; margin: 20px 0; border: 1px solid #334155;">
+                        <span style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #38bdf8;">${otp}</span>
+                      </div>
+                      <p style="color: #64748b; font-size: 12px;">This code will expire in 10 minutes. If you did not request this code, please ignore this email.</p>
+                    </div>
+                  `
+                })
+              });
+              if (!brevoRes.ok) {
+                const errData = await brevoRes.json();
+                throw new Error(errData.message || 'Brevo API error');
+              }
+              return res.json({ message: 'OTP code sent to your email.' });
+            } catch (apiErr) {
+              console.error("Failed to send email via Brevo API:", apiErr);
+              return res.status(500).json({ message: `Email API Error (Brevo): ${apiErr.message || apiErr}` });
+            }
+          }
+
+          // ─── OPTION B: Resend HTTP API ───
+          if (process.env.RESEND_API_KEY) {
+            try {
+              const resendRes = await fetch('https://api.resend.com/emails', {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${process.env.RESEND_API_KEY.trim()}`,
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                  from: process.env.EMAIL_USER || 'onboarding@resend.dev',
+                  to: cleanEmail,
+                  subject: 'Your Paraiso Gaming Registration OTP Code',
+                  html: `
+                    <div style="font-family: Arial, sans-serif; background: #080d13; color: #fff; padding: 30px; border-radius: 16px; max-width: 480px; margin: 0 auto; border: 1px solid #1e293b;">
+                      <h2 style="color: #06b6d4; text-transform: uppercase; margin-bottom: 8px;">Paraiso Gaming</h2>
+                      <p style="color: #94a3b8; font-size: 14px;">Use the following OTP code to complete your registration:</p>
+                      <div style="background: #0d1117; padding: 18px; border-radius: 12px; text-align: center; margin: 20px 0; border: 1px solid #334155;">
+                        <span style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #38bdf8;">${otp}</span>
+                      </div>
+                      <p style="color: #64748b; font-size: 12px;">This code will expire in 10 minutes. If you did not request this code, please ignore this email.</p>
+                    </div>
+                  `
+                })
+              });
+              if (!resendRes.ok) {
+                const errData = await resendRes.json();
+                throw new Error(errData.message || 'Resend API error');
+              }
+              return res.json({ message: 'OTP code sent to your email.' });
+            } catch (apiErr) {
+              console.error("Failed to send email via Resend API:", apiErr);
+              return res.status(500).json({ message: `Email API Error (Resend): ${apiErr.message || apiErr}` });
+            }
+          }
+
+          // ─── OPTION C: Fallback to standard SMTP ───
           const transporter = getTransporter();
           if (!transporter) {
             return res.status(500).json({ message: 'Email system not configured. Set EMAIL_USER & EMAIL_PASS.' });
