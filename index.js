@@ -37,8 +37,8 @@ const getTransporter = () => {
     const cleanPass = process.env.EMAIL_PASS.replace(/\s+/g, '');
     return nodemailer.createTransport({
       host: 'smtp.gmail.com',
-      port: 465,
-      secure: true,
+      port: 587,
+      secure: false, // TLS / STARTTLS
       family: 4, // Force IPv4
       auth: {
         user: cleanUser,
