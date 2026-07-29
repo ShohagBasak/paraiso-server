@@ -582,6 +582,7 @@ app.post('/send-otp', registerLimiter, async (req, res) => {
 
 // ─── POST /public-register (Public — community user registration with OTP & Turnstile) ───
 app.post('/public-register', registerLimiter, async (req, res) => {
+  console.log("Received /public-register request for:", req.body?.email);
   try {
     const { username, email, password, otp, turnstileToken } = req.body;
     if (!username || !email || !password || !otp) {
@@ -618,33 +619,58 @@ app.post('/public-register', registerLimiter, async (req, res) => {
       "SELECT * FROM email_otps WHERE email = ? AND otp = ? AND expires_at > NOW() ORDER BY id DESC LIMIT 1",
       [cleanEmail, otp.trim()],
       async (otpErr, otpResults) => {
-        if (otpErr || !otpResults || otpResults.length === 0) {
-          return res.status(400).json({ message: "Invalid or expired OTP code. Please request a new code." });
-        }
-
-        const hashedPassword = await bcrypt.hash(password, 10);
-        const sql = `INSERT INTO users (username, email, password_hash, role) VALUES (?, ?, ?, 'user')`;
-
-        db.query(sql, [username.trim(), cleanEmail, hashedPassword], (err, result) => {
-          if (err) {
-            if (err.code === 'ER_DUP_ENTRY') {
-              return res.status(409).json({ message: "An account with this email already exists." });
-            }
-            return res.status(500).json({ message: "Registration failed. Please try again." });
+        try {
+          if (otpErr) {
+            console.error("OTP DB Select Error:", otpErr);
+            return res.status(500).json({ message: "Database error during registration verification." });
           }
-          const newUserId = result.insertId;
+          if (!otpResults || otpResults.length === 0) {
+            return res.status(400).json({ message: "Invalid or expired OTP code. Please request a new code." });
+          }
 
-          // Clear used OTP
-          db.query("DELETE FROM email_otps WHERE email = ?", [cleanEmail], () => {});
+          const hashedPassword = await bcrypt.hash(password, 10);
+          const sql = `INSERT INTO users (username, email, password_hash, role) VALUES (?, ?, ?, 'user')`;
 
-          const token = jwt.sign({ id: newUserId, email: cleanEmail, role: 'user' }, process.env.JWT_SECRET, { expiresIn: '7d' });
-          res.cookie('token', token, cookieOptions);
-          res.status(201).json({
-            message: 'Registration successful!',
-            token,
-            user: { id: newUserId, username: username.trim(), email: cleanEmail, role: 'user', permissions: [] }
+          db.query(sql, [username.trim(), cleanEmail, hashedPassword], (err, result) => {
+            try {
+              if (err) {
+                if (err.code === 'ER_DUP_ENTRY') {
+                  return res.status(409).json({ message: "An account with this email already exists." });
+                }
+                console.error("User INSERT error:", err);
+                return res.status(500).json({ message: "Registration failed. Please try again." });
+              }
+
+              if (!result) {
+                console.error("User INSERT result is undefined");
+                return res.status(500).json({ message: "Registration failed: no database response." });
+              }
+              const newUserId = result.insertId;
+
+              // Clear used OTP
+              db.query("DELETE FROM email_otps WHERE email = ?", [cleanEmail], () => {});
+
+              if (!process.env.JWT_SECRET) {
+                console.error("JWT_SECRET is missing from environment variables!");
+                return res.status(500).json({ message: "Server configuration error: JWT_SECRET not set on host." });
+              }
+
+              const token = jwt.sign({ id: newUserId, email: cleanEmail, role: 'user' }, process.env.JWT_SECRET, { expiresIn: '7d' });
+              res.cookie('token', token, cookieOptions);
+              res.status(201).json({
+                message: 'Registration successful!',
+                token,
+                user: { id: newUserId, username: username.trim(), email: cleanEmail, role: 'user', permissions: [] }
+              });
+            } catch (innerErr) {
+              console.error("Error inside INSERT callback:", innerErr);
+              res.status(500).json({ message: `Internal server error: ${innerErr.message}` });
+            }
           });
-        });
+        } catch (callbackErr) {
+          console.error("Error inside SELECT OTP callback:", callbackErr);
+          res.status(500).json({ message: `Internal server error: ${callbackErr.message}` });
+        }
       }
     );
   } catch (err) {
