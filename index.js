@@ -75,7 +75,6 @@ db.query(`
 `, (err) => {
   if (err) console.error("Error creating admin_permissions table:", err);
   else {
-    console.log("Verified admin_permissions table exists.");
     // Auto-promote: If there is no user with role 'master', promote the first admin or user with lowest ID
     db.query("SELECT 1 FROM users WHERE role = 'master'", (err2, masterResults) => {
       if (!err2 && (!masterResults || masterResults.length === 0)) {
@@ -115,7 +114,6 @@ db.query(`
   )
 `, (err) => {
   if (err) console.error("Error creating allowed_registration_emails table:", err);
-  else console.log("Verified allowed_registration_emails table exists.");
 });
 
 // ─── Initialize Email OTPs Table ─────────────────────────────
@@ -130,7 +128,6 @@ db.query(`
   )
 `, (err) => {
   if (err) console.error("Error creating email_otps table:", err);
-  else console.log("Verified email_otps table exists.");
 });
 
 // ─── Initialize Donate Categories Table ───────────────────
@@ -143,7 +140,6 @@ db.query(`
   )
 `, (err) => {
   if (err) console.error("Error creating donate_categories table:", err);
-  else console.log("Verified donate_categories table exists.");
 });
 
 // ─── Initialize Donate Items Table ────────────────────────
@@ -162,7 +158,6 @@ db.query(`
   )
 `, (err) => {
   if (err) console.error("Error creating donate_items table:", err);
-  else console.log("Verified donate_items table exists.");
 });
 
 // ─── Initialize Purchase Tickets Table ────────────────────
@@ -185,7 +180,6 @@ db.query(`
 `, (err) => {
   if (err) console.error("Error creating purchase_tickets table:", err);
   else {
-    console.log("Verified purchase_tickets table exists.");
     // Auto-alter table to ensure new columns exist for existing databases
     db.query("ALTER TABLE purchase_tickets ADD COLUMN IF NOT EXISTS ingame_name VARCHAR(255) DEFAULT ''", () => {});
     db.query("ALTER TABLE purchase_tickets ADD COLUMN IF NOT EXISTS discord_username VARCHAR(255) DEFAULT ''", () => {});
@@ -206,7 +200,6 @@ db.query(`
   )
 `, (err) => {
   if (err) console.error("Error creating ticket_messages table:", err);
-  else console.log("Verified ticket_messages table exists.");
 });
 
 // ─── verifyToken Middleware ────────────────────────────────
@@ -479,14 +472,12 @@ app.post('/send-otp', registerLimiter, async (req, res) => {
                   </div>
                 `
               });
-              console.log(`[OTP SENT] Code ${otp} sent to ${cleanEmail}`);
               res.json({ message: 'OTP code sent to your email.' });
             } catch (mailErr) {
               console.error("Failed to send email via SMTP:", mailErr);
               res.json({ message: 'OTP generated. Please check your inbox.', devOtp: otp });
             }
           } else {
-            console.log(`[DEV MODE - OTP GENERATED] Email: ${cleanEmail} | OTP: ${otp}`);
             res.json({ 
               message: 'OTP generated! (Set EMAIL_USER & EMAIL_PASS in .env for live email delivery)', 
               devOtp: otp 
@@ -2904,9 +2895,25 @@ app.delete('/donate-items/:id', verifyPermission('donate'), (req, res) => {
   });
 });
 
-// ════════════════════════════════════════════════════════════
+// PUT /donate-items-reorder — admin: reorder items
+app.put('/donate-items-reorder', verifyPermission('donate'), (req, res) => {
+  const { orders } = req.body;
+  if (!Array.isArray(orders)) return res.status(400).json({ message: 'Invalid data' });
+  if (orders.length === 0) return res.json({ message: 'Order updated' });
+  let completed = 0;
+  let hasError = false;
+  orders.forEach((item) => {
+    db.query("UPDATE donate_items SET sort_order = ? WHERE id = ?", [item.sort_order, item.id], (err) => {
+      if (err && !hasError) { hasError = true; return res.status(500).json({ message: 'Failed to update order' }); }
+      completed++;
+      if (completed === orders.length && !hasError) res.json({ message: 'Items reordered' });
+    });
+  });
+});
+
+
 // PURCHASE TICKETS ENDPOINTS
-// ════════════════════════════════════════════════════════════
+
 
 // POST /tickets — authenticated user: create ticket
 app.post('/tickets', verifyToken, (req, res) => {
