@@ -465,33 +465,30 @@ app.post('/send-otp', registerLimiter, async (req, res) => {
           if (insertErr) return res.status(500).json({ message: 'Failed to generate OTP.' });
 
           const transporter = getTransporter();
-          if (transporter) {
-            try {
-              await transporter.sendMail({
-                from: `"Paraiso Gaming" <${process.env.EMAIL_USER}>`,
-                to: cleanEmail,
-                subject: 'Your Paraiso Gaming Registration OTP Code',
-                html: `
-                  <div style="font-family: Arial, sans-serif; background: #080d13; color: #fff; padding: 30px; border-radius: 16px; max-width: 480px; margin: 0 auto; border: 1px solid #1e293b;">
-                    <h2 style="color: #06b6d4; text-transform: uppercase; margin-bottom: 8px;">Paraiso Gaming</h2>
-                    <p style="color: #94a3b8; font-size: 14px;">Use the following OTP code to complete your registration:</p>
-                    <div style="background: #0d1117; padding: 18px; border-radius: 12px; text-align: center; margin: 20px 0; border: 1px solid #334155;">
-                      <span style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #38bdf8;">${otp}</span>
-                    </div>
-                    <p style="color: #64748b; font-size: 12px;">This code will expire in 10 minutes. If you did not request this code, please ignore this email.</p>
+          if (!transporter) {
+            return res.status(500).json({ message: 'Email system not configured. Set EMAIL_USER & EMAIL_PASS.' });
+          }
+
+          try {
+            await transporter.sendMail({
+              from: `"Paraiso Gaming" <${process.env.EMAIL_USER}>`,
+              to: cleanEmail,
+              subject: 'Your Paraiso Gaming Registration OTP Code',
+              html: `
+                <div style="font-family: Arial, sans-serif; background: #080d13; color: #fff; padding: 30px; border-radius: 16px; max-width: 480px; margin: 0 auto; border: 1px solid #1e293b;">
+                  <h2 style="color: #06b6d4; text-transform: uppercase; margin-bottom: 8px;">Paraiso Gaming</h2>
+                  <p style="color: #94a3b8; font-size: 14px;">Use the following OTP code to complete your registration:</p>
+                  <div style="background: #0d1117; padding: 18px; border-radius: 12px; text-align: center; margin: 20px 0; border: 1px solid #334155;">
+                    <span style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #38bdf8;">${otp}</span>
                   </div>
-                `
-              });
-              res.json({ message: 'OTP code sent to your email.' });
-            } catch (mailErr) {
-              console.error("Failed to send email via SMTP:", mailErr);
-              res.json({ message: 'OTP generated. Please check your inbox.', devOtp: otp });
-            }
-          } else {
-            res.json({ 
-              message: 'OTP generated! (Set EMAIL_USER & EMAIL_PASS in .env for live email delivery)', 
-              devOtp: otp 
+                  <p style="color: #64748b; font-size: 12px;">This code will expire in 10 minutes. If you did not request this code, please ignore this email.</p>
+                </div>
+              `
             });
+            res.json({ message: 'OTP code sent to your email.' });
+          } catch (mailErr) {
+            console.error("Failed to send email via SMTP:", mailErr);
+            res.status(500).json({ message: `SMTP Error: ${mailErr.message || mailErr}` });
           }
         });
       });
