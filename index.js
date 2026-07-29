@@ -177,12 +177,20 @@ db.query(`
     id INT AUTO_INCREMENT PRIMARY KEY,
     email VARCHAR(255) NOT NULL,
     otp VARCHAR(10) NOT NULL,
+    type VARCHAR(30) DEFAULT 'registration',
     expires_at DATETIME NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     INDEX (email)
   )
 `, (err) => {
   if (err) console.error("Error creating email_otps table:", err);
+  else {
+    db.query("SHOW COLUMNS FROM email_otps LIKE 'type'", (err2, rows) => {
+      if (!err2 && rows && rows.length === 0) {
+        db.query("ALTER TABLE email_otps ADD COLUMN type VARCHAR(30) DEFAULT 'registration'", () => {});
+      }
+    });
+  }
 });
 
 // ─── Initialize Donate Categories Table ───────────────────
@@ -485,8 +493,85 @@ app.delete('/allowed-emails/:id', verifyMaster, (req, res) => {
   );
 });
 
-// ─── POST /send-otp (Send 6-digit registration OTP to email) ───
-app.post('/send-otp', registerLimiter, async (req, res) => {
+// ─── HELPER: Send Email (SMTP / Brevo / Resend) ───
+const sendEmailHelper = async ({ to, subject, description, otp, expiryMinutes = 15 }) => {
+  const htmlContent = `
+    <div style="font-family: Arial, sans-serif; background: #080d13; color: #fff; padding: 30px; border-radius: 16px; max-width: 480px; margin: 0 auto; border: 1px solid #1e293b;">
+      <h2 style="color: #06b6d4; text-transform: uppercase; margin-bottom: 8px;">Paraiso Gaming</h2>
+      <p style="color: #94a3b8; font-size: 14px;">${description}</p>
+      <div style="background: #0d1117; padding: 18px; border-radius: 12px; text-align: center; margin: 20px 0; border: 1px solid #334155;">
+        <span style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #38bdf8;">${otp}</span>
+      </div>
+      <p style="color: #64748b; font-size: 12px;">This code will expire in ${expiryMinutes} minutes. If you did not request this code, please ignore this email.</p>
+    </div>
+  `;
+
+  if (process.env.BREVO_API_KEY) {
+    try {
+      const res = await httpsPost(
+        'https://api.brevo.com/v3/smtp/email',
+        {
+          'accept': 'application/json',
+          'api-key': process.env.BREVO_API_KEY.trim(),
+          'content-type': 'application/json'
+        },
+        JSON.stringify({
+          sender: { name: "Paraiso Gaming", email: process.env.EMAIL_USER || "noreply@paraisogaming.com" },
+          to: [{ email: to }],
+          subject,
+          htmlContent
+        })
+      );
+      if (!res.ok) throw new Error('Brevo API error');
+      return { success: true };
+    } catch (err) {
+      console.error("Brevo Email error:", err);
+      return { success: false, error: err.message };
+    }
+  }
+
+  if (process.env.RESEND_API_KEY) {
+    try {
+      const res = await httpsPost(
+        'https://api.resend.com/emails',
+        {
+          'Authorization': `Bearer ${process.env.RESEND_API_KEY.trim()}`,
+          'Content-Type': 'application/json'
+        },
+        JSON.stringify({
+          from: process.env.EMAIL_USER || 'onboarding@resend.dev',
+          to,
+          subject,
+          html: htmlContent
+        })
+      );
+      if (!res.ok) throw new Error('Resend API error');
+      return { success: true };
+    } catch (err) {
+      console.error("Resend Email error:", err);
+      return { success: false, error: err.message };
+    }
+  }
+
+  const transporter = getTransporter();
+  if (!transporter) return { success: false, error: 'Email system not configured.' };
+
+  try {
+    await transporter.sendMail({
+      from: `"Paraiso Gaming" <${process.env.EMAIL_USER}>`,
+      to,
+      subject,
+      html: htmlContent
+    });
+    return { success: true };
+  } catch (err) {
+    console.error("SMTP Email error:", err);
+    return { success: false, error: err.message };
+  }
+};
+
+// ─── POST /forgot-password (Request 6-digit password reset OTP) ───
+app.post('/forgot-password', registerLimiter, async (req, res) => {
   try {
     const { email } = req.body;
     if (!email || !email.includes('@')) {
@@ -494,133 +579,124 @@ app.post('/send-otp', registerLimiter, async (req, res) => {
     }
     const cleanEmail = email.toLowerCase().trim();
 
-    // Check if account already exists
-    db.query("SELECT id FROM users WHERE email = ?", [cleanEmail], (err, results) => {
-      if (err) return res.status(500).json({ message: 'Database error.' });
-      if (results && results.length > 0) {
-        return res.status(409).json({ message: 'An account with this email already exists.' });
-      }
-
-      // Generate 6-digit OTP
-      const otp = Math.floor(100000 + Math.random() * 900000).toString();
-      const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
-
-      db.query("DELETE FROM email_otps WHERE email = ?", [cleanEmail], () => {
-        db.query("INSERT INTO email_otps (email, otp, expires_at) VALUES (?, ?, ?)", [cleanEmail, otp, expiresAt], async (insertErr) => {
-          if (insertErr) return res.status(500).json({ message: 'Failed to generate OTP.' });
-
-          // ─── OPTION 0: Developer / Test Bypass Mode ───
-          if (process.env.DEV_MODE === 'true') {
-            console.log(`[DEV_MODE] Bypass sending email. Registration OTP code for ${cleanEmail} is: ${otp}`);
-            return res.json({ message: `[DEV_MODE Active] OTP code is: ${otp}`, devOtp: otp });
-          }
-
-          // ─── OPTION A: Brevo HTTP API (Recommended for free tier) ───
-          if (process.env.BREVO_API_KEY) {
-            try {
-              const brevoRes = await httpsPost(
-                'https://api.brevo.com/v3/smtp/email',
-                {
-                  'accept': 'application/json',
-                  'api-key': process.env.BREVO_API_KEY.trim(),
-                  'content-type': 'application/json'
-                },
-                JSON.stringify({
-                  sender: { name: "Paraiso Gaming", email: process.env.EMAIL_USER || "noreply@paraisogaming.com" },
-                  to: [{ email: cleanEmail }],
-                  subject: 'Your Paraiso Gaming Registration OTP Code',
-                  htmlContent: `
-                    <div style="font-family: Arial, sans-serif; background: #080d13; color: #fff; padding: 30px; border-radius: 16px; max-width: 480px; margin: 0 auto; border: 1px solid #1e293b;">
-                      <h2 style="color: #06b6d4; text-transform: uppercase; margin-bottom: 8px;">Paraiso Gaming</h2>
-                      <p style="color: #94a3b8; font-size: 14px;">Use the following OTP code to complete your registration:</p>
-                      <div style="background: #0d1117; padding: 18px; border-radius: 12px; text-align: center; margin: 20px 0; border: 1px solid #334155;">
-                        <span style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #38bdf8;">${otp}</span>
-                      </div>
-                      <p style="color: #64748b; font-size: 12px;">This code will expire in 10 minutes. If you did not request this code, please ignore this email.</p>
-                    </div>
-                  `
-                })
-              );
-              if (!brevoRes.ok) {
-                const errData = await brevoRes.json();
-                throw new Error(errData.message || 'Brevo API error');
-              }
-              return res.json({ message: 'OTP code sent to your email.' });
-            } catch (apiErr) {
-              console.error("Failed to send email via Brevo API:", apiErr);
-              return res.status(500).json({ message: `Email API Error (Brevo): ${apiErr.message || apiErr}` });
-            }
-          }
-
-          // ─── OPTION B: Resend HTTP API ───
-          if (process.env.RESEND_API_KEY) {
-            try {
-              const resendRes = await httpsPost(
-                'https://api.resend.com/emails',
-                {
-                  'Authorization': `Bearer ${process.env.RESEND_API_KEY.trim()}`,
-                  'Content-Type': 'application/json'
-                },
-                JSON.stringify({
-                  from: process.env.EMAIL_USER || 'onboarding@resend.dev',
-                  to: cleanEmail,
-                  subject: 'Your Paraiso Gaming Registration OTP Code',
-                  html: `
-                    <div style="font-family: Arial, sans-serif; background: #080d13; color: #fff; padding: 30px; border-radius: 16px; max-width: 480px; margin: 0 auto; border: 1px solid #1e293b;">
-                      <h2 style="color: #06b6d4; text-transform: uppercase; margin-bottom: 8px;">Paraiso Gaming</h2>
-                      <p style="color: #94a3b8; font-size: 14px;">Use the following OTP code to complete your registration:</p>
-                      <div style="background: #0d1117; padding: 18px; border-radius: 12px; text-align: center; margin: 20px 0; border: 1px solid #334155;">
-                        <span style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #38bdf8;">${otp}</span>
-                      </div>
-                      <p style="color: #64748b; font-size: 12px;">This code will expire in 10 minutes. If you did not request this code, please ignore this email.</p>
-                    </div>
-                  `
-                })
-              );
-              if (!resendRes.ok) {
-                const errData = await resendRes.json();
-                throw new Error(errData.message || 'Resend API error');
-              }
-              return res.json({ message: 'OTP code sent to your email.' });
-            } catch (apiErr) {
-              console.error("Failed to send email via Resend API:", apiErr);
-              return res.status(500).json({ message: `Email API Error (Resend): ${apiErr.message || apiErr}` });
-            }
-          }
-
-          // ─── OPTION C: Fallback to standard SMTP ───
-          const transporter = getTransporter();
-          if (!transporter) {
-            return res.status(500).json({ message: 'Email system not configured. Set EMAIL_USER & EMAIL_PASS.' });
-          }
-
-          try {
-            await transporter.sendMail({
-              from: `"Paraiso Gaming" <${process.env.EMAIL_USER}>`,
-              to: cleanEmail,
-              subject: 'Your Paraiso Gaming Registration OTP Code',
-              html: `
-                <div style="font-family: Arial, sans-serif; background: #080d13; color: #fff; padding: 30px; border-radius: 16px; max-width: 480px; margin: 0 auto; border: 1px solid #1e293b;">
-                  <h2 style="color: #06b6d4; text-transform: uppercase; margin-bottom: 8px;">Paraiso Gaming</h2>
-                  <p style="color: #94a3b8; font-size: 14px;">Use the following OTP code to complete your registration:</p>
-                  <div style="background: #0d1117; padding: 18px; border-radius: 12px; text-align: center; margin: 20px 0; border: 1px solid #334155;">
-                    <span style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #38bdf8;">${otp}</span>
-                  </div>
-                  <p style="color: #64748b; font-size: 12px;">This code will expire in 10 minutes. If you did not request this code, please ignore this email.</p>
-                </div>
-              `
-            });
-            res.json({ message: 'OTP code sent to your email.' });
-          } catch (mailErr) {
-            console.error("Failed to send email via SMTP:", mailErr);
-            res.status(500).json({ message: `SMTP Error: ${mailErr.message || mailErr}` });
-          }
-        });
+    const userRows = await new Promise((resolve, reject) => {
+      db.query("SELECT id, username FROM users WHERE email = ?", [cleanEmail], (err, rows) => {
+        if (err) reject(err);
+        else resolve(rows || []);
       });
     });
+
+    if (userRows.length === 0) {
+      return res.status(404).json({ message: 'No account found with this email address.' });
+    }
+
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+
+    await new Promise((resolve) => {
+      db.query("DELETE FROM email_otps WHERE email = ?", [cleanEmail], () => resolve());
+    });
+
+    await new Promise((resolve, reject) => {
+      db.query(
+        "INSERT INTO email_otps (email, otp, expires_at, type) VALUES (?, ?, ?, 'password_reset')",
+        [cleanEmail, otp, expiresAt],
+        (err) => {
+          if (err) {
+            db.query("INSERT INTO email_otps (email, otp, expires_at) VALUES (?, ?, ?)", [cleanEmail, otp, expiresAt], (err2) => {
+              if (err2) reject(err2);
+              else resolve();
+            });
+          } else {
+            resolve();
+          }
+        }
+      );
+    });
+
+    if (process.env.DEV_MODE === 'true') {
+      console.log(`[DEV_MODE] Password Reset OTP for ${cleanEmail} is: ${otp}`);
+      return res.json({ message: `[DEV_MODE] Reset code is: ${otp}`, devOtp: otp });
+    }
+
+    const emailSent = await sendEmailHelper({
+      to: cleanEmail,
+      subject: '🔒 Password Reset Code - Paraiso Gaming',
+      description: `Hello <strong>${userRows[0].username}</strong>,<br/>Use the following 6-digit OTP code to reset your password:`,
+      otp: otp,
+      expiryMinutes: 15
+    });
+
+    if (emailSent.success) {
+      res.json({ message: 'Password reset code sent to your email.' });
+    } else {
+      res.status(500).json({ message: emailSent.error || 'Failed to send reset email.' });
+    }
   } catch (err) {
-    console.error("SEND OTP ERROR:", err);
-    res.status(500).json({ message: 'Server error sending OTP.' });
+    console.error("FORGOT PASSWORD ERROR:", err);
+    res.status(500).json({ message: err.message || 'Server error processing request.' });
+  }
+});
+
+// ─── POST /reset-password (Verify OTP and update user password) ───
+app.post('/reset-password', registerLimiter, async (req, res) => {
+  try {
+    const { email, otp, newPassword } = req.body;
+    if (!email || !otp || !newPassword) {
+      return res.status(400).json({ message: 'Email, OTP reset code, and new password are required.' });
+    }
+    if (newPassword.length < 6) {
+      return res.status(400).json({ message: 'New password must be at least 6 characters.' });
+    }
+
+    const cleanEmail = email.toLowerCase().trim();
+    const cleanOtp = otp.toString().trim();
+
+    const results = await new Promise((resolve, reject) => {
+      db.query(
+        "SELECT id FROM email_otps WHERE email = ? AND otp = ? AND expires_at > NOW()",
+        [cleanEmail, cleanOtp],
+        (err, rows) => {
+          if (err) reject(err);
+          else resolve(rows || []);
+        }
+      );
+    });
+
+    if (!results || results.length === 0) {
+      const fallbackRows = await new Promise((resolve) => {
+        db.query("SELECT id FROM email_otps WHERE email = ? AND otp = ?", [cleanEmail, cleanOtp], (err, rows) => {
+          resolve(rows || []);
+        });
+      });
+
+      if (fallbackRows.length === 0) {
+        return res.status(400).json({ message: 'Invalid 6-digit OTP code.' });
+      } else {
+        return res.status(400).json({ message: 'OTP code has expired. Please request a new code.' });
+      }
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    await new Promise((resolve, reject) => {
+      db.query("UPDATE users SET password_hash = ? WHERE email = ?", [hashedPassword, cleanEmail], (err, result) => {
+        if (err) {
+          db.query("UPDATE users SET password = ? WHERE email = ?", [hashedPassword, cleanEmail], (err2, result2) => {
+            if (err2) reject(err2);
+            else resolve(result2);
+          });
+        } else {
+          resolve(result);
+        }
+      });
+    });
+
+    db.query("DELETE FROM email_otps WHERE email = ?", [cleanEmail], () => {});
+
+    res.json({ message: 'Password updated successfully! You can now log in.' });
+  } catch (err) {
+    console.error("RESET PASSWORD ERROR:", err);
+    res.status(500).json({ message: err.message || 'Server error resetting password.' });
   }
 });
 
@@ -3043,6 +3119,13 @@ db.query("SHOW COLUMNS FROM purchase_tickets LIKE 'order_type'", (err, rows) => 
   if (!err && rows && rows.length === 0) {
     db.query("ALTER TABLE purchase_tickets ADD COLUMN order_type VARCHAR(20) DEFAULT 'new'", (err2) => {
       if (!err2) console.log("Added order_type column to purchase_tickets table.");
+    });
+  }
+});
+db.query("SHOW COLUMNS FROM email_otps LIKE 'type'", (err, rows) => {
+  if (!err && rows && rows.length === 0) {
+    db.query("ALTER TABLE email_otps ADD COLUMN type VARCHAR(30) DEFAULT 'registration'", (err2) => {
+      if (!err2) console.log("Added type column to email_otps table.");
     });
   }
 });
