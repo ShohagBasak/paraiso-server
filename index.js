@@ -442,6 +442,7 @@ app.delete('/allowed-emails/:id', verifyMaster, (req, res) => {
 
 // ─── POST /send-otp (Send 6-digit registration OTP to email) ───
 app.post('/send-otp', registerLimiter, async (req, res) => {
+  console.log("Received /send-otp request for:", req.body?.email);
   try {
     const { email } = req.body;
     if (!email || !email.includes('@')) {
