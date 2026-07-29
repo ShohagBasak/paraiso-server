@@ -1,5 +1,6 @@
 const express = require('express');
 const http = require('http');
+const https = require('https');
 const db = require('./db');
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
@@ -15,6 +16,46 @@ const dns = require('dns');
 
 if (dns.setDefaultResultOrder) {
   dns.setDefaultResultOrder('ipv4first');
+}
+
+// ─── Native HTTPS POST Helper (Version-agnostic fallback for fetch) ───
+function httpsPost(urlStr, headers, bodyData) {
+  return new Promise((resolve, reject) => {
+    try {
+      const url = new URL(urlStr);
+      const options = {
+        method: 'POST',
+        hostname: url.hostname,
+        path: url.pathname + url.search,
+        headers: headers
+      };
+
+      const req = https.request(options, (res) => {
+        let data = '';
+        res.on('data', (chunk) => { data += chunk; });
+        res.on('end', () => {
+          resolve({
+            ok: res.statusCode >= 200 && res.statusCode < 300,
+            status: res.statusCode,
+            json: async () => {
+              try {
+                return JSON.parse(data);
+              } catch {
+                return { message: data };
+              }
+            },
+            text: async () => data
+          });
+        });
+      });
+
+      req.on('error', (err) => reject(err));
+      if (bodyData) req.write(bodyData);
+      req.end();
+    } catch (e) {
+      reject(e);
+    }
+  });
 }
 
 const app = express();
@@ -474,14 +515,14 @@ app.post('/send-otp', registerLimiter, async (req, res) => {
           // ─── OPTION A: Brevo HTTP API (Recommended for free tier) ───
           if (process.env.BREVO_API_KEY) {
             try {
-              const brevoRes = await fetch('https://api.brevo.com/v3/smtp/email', {
-                method: 'POST',
-                headers: {
+              const brevoRes = await httpsPost(
+                'https://api.brevo.com/v3/smtp/email',
+                {
                   'accept': 'application/json',
                   'api-key': process.env.BREVO_API_KEY.trim(),
                   'content-type': 'application/json'
                 },
-                body: JSON.stringify({
+                JSON.stringify({
                   sender: { name: "Paraiso Gaming", email: process.env.EMAIL_USER || "noreply@paraisogaming.com" },
                   to: [{ email: cleanEmail }],
                   subject: 'Your Paraiso Gaming Registration OTP Code',
@@ -496,7 +537,7 @@ app.post('/send-otp', registerLimiter, async (req, res) => {
                     </div>
                   `
                 })
-              });
+              );
               if (!brevoRes.ok) {
                 const errData = await brevoRes.json();
                 throw new Error(errData.message || 'Brevo API error');
@@ -511,13 +552,13 @@ app.post('/send-otp', registerLimiter, async (req, res) => {
           // ─── OPTION B: Resend HTTP API ───
           if (process.env.RESEND_API_KEY) {
             try {
-              const resendRes = await fetch('https://api.resend.com/emails', {
-                method: 'POST',
-                headers: {
+              const resendRes = await httpsPost(
+                'https://api.resend.com/emails',
+                {
                   'Authorization': `Bearer ${process.env.RESEND_API_KEY.trim()}`,
                   'Content-Type': 'application/json'
                 },
-                body: JSON.stringify({
+                JSON.stringify({
                   from: process.env.EMAIL_USER || 'onboarding@resend.dev',
                   to: cleanEmail,
                   subject: 'Your Paraiso Gaming Registration OTP Code',
@@ -532,7 +573,7 @@ app.post('/send-otp', registerLimiter, async (req, res) => {
                     </div>
                   `
                 })
-              });
+              );
               if (!resendRes.ok) {
                 const errData = await resendRes.json();
                 throw new Error(errData.message || 'Resend API error');
@@ -597,14 +638,14 @@ app.post('/public-register', registerLimiter, async (req, res) => {
     // ── Turnstile Verification (if secret key configured) ──
     if (process.env.TURNSTILE_SECRET_KEY && turnstileToken) {
       try {
-        const verifyRes = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({
+        const verifyRes = await httpsPost(
+          'https://challenges.cloudflare.com/turnstile/v0/siteverify',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          new URLSearchParams({
             secret: process.env.TURNSTILE_SECRET_KEY,
             response: turnstileToken
-          })
-        });
+          }).toString()
+        );
         const verifyData = await verifyRes.json();
         if (!verifyData.success) {
           return res.status(400).json({ message: "Turnstile captcha verification failed. Please try again." });
