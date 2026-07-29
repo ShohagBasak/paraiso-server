@@ -682,23 +682,47 @@ app.post('/public-register', registerLimiter, async (req, res) => {
 // ─── POST /login ──────────────────────────────────────────
 app.post('/login', (req, res) => {
   const { email, password } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ message: "Email and password are required." });
+  }
   const sql = "SELECT * FROM users WHERE email = ?";
   db.query(sql, [email], async (err, results) => {
-    if (err || results.length === 0) return res.status(400).json({ message: "User not found" });
-    const match = await bcrypt.compare(password, results[0].password_hash);
-    if (!match) return res.status(401).json({ message: "Invalid password" });
-    const { id, username, role } = results[0];
+    try {
+      if (err) {
+        console.error("Login SELECT error:", err);
+        return res.status(500).json({ message: "Database error during login." });
+      }
+      if (!results || results.length === 0) {
+        return res.status(400).json({ message: "User not found" });
+      }
+      const match = await bcrypt.compare(password, results[0].password_hash);
+      if (!match) return res.status(401).json({ message: "Invalid password" });
+      const { id, username, role } = results[0];
 
-    const token = jwt.sign({ id, email, role }, process.env.JWT_SECRET, { expiresIn: '7d' });
-    res.cookie('token', token, cookieOptions);
-    
-    db.query("SELECT permission_key FROM admin_permissions WHERE user_id = ?", [id], (err2, permResults) => {
-      const permissions = !err2 && permResults ? permResults.map(p => p.permission_key) : [];
-      res.json({ 
-        token,
-        user: { id, username, email, role, permissions } 
+      if (!process.env.JWT_SECRET) {
+        console.error("JWT_SECRET is missing from environment variables!");
+        return res.status(500).json({ message: "Server configuration error: JWT_SECRET not set on host." });
+      }
+
+      const token = jwt.sign({ id, email, role }, process.env.JWT_SECRET, { expiresIn: '7d' });
+      res.cookie('token', token, cookieOptions);
+      
+      db.query("SELECT permission_key FROM admin_permissions WHERE user_id = ?", [id], (err2, permResults) => {
+        try {
+          const permissions = !err2 && permResults ? permResults.map(p => p.permission_key) : [];
+          res.json({ 
+            token,
+            user: { id, username, email, role, permissions } 
+          });
+        } catch (innerErr) {
+          console.error("Error inside admin_permissions SELECT callback:", innerErr);
+          res.status(500).json({ message: `Internal server error: ${innerErr.message}` });
+        }
       });
-    });
+    } catch (callbackErr) {
+      console.error("Error inside login callback:", callbackErr);
+      res.status(500).json({ message: `Internal server error: ${callbackErr.message}` });
+    }
   });
 });
 
