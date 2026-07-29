@@ -13,12 +13,13 @@ const nodemailer = require('nodemailer');
 const rateLimit = require('express-rate-limit');
 
 const app = express();
+app.set('trust proxy', 1);
 const server = http.createServer(app);
 
 // ─── Rate Limiter for Registration & OTP ───
 const registerLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 5, // Limit each IP to 5 requests per 15 minutes
+  max: 10, // Limit each IP to 10 requests per 15 minutes
   message: { message: "Too many registration attempts from this IP. Please try again after 15 minutes." },
   standardHeaders: true,
   legacyHeaders: false,
@@ -36,6 +37,9 @@ const getTransporter = () => {
       auth: {
         user: cleanUser,
         pass: cleanPass
+      },
+      tls: {
+        rejectUnauthorized: false
       }
     });
   }
