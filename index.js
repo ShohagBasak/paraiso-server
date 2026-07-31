@@ -77,8 +77,10 @@ const getTransporter = () => {
     const cleanUser = process.env.EMAIL_USER.trim();
     const cleanPass = process.env.EMAIL_PASS.trim();
     const isGmail = cleanUser.endsWith('@gmail.com');
-    const host = process.env.EMAIL_HOST || (isGmail ? 'smtp.gmail.com' : 'smtppro.zoho.com');
-    const port = parseInt(process.env.EMAIL_PORT) || (isGmail ? 587 : 465);
+    
+    // Default to smtp.zoho.com for custom domain/zoho and port 587 (STARTTLS works best on Render)
+    const host = process.env.EMAIL_HOST || (isGmail ? 'smtp.gmail.com' : 'smtp.zoho.com');
+    const port = parseInt(process.env.EMAIL_PORT, 10) || 587;
     const secure = port === 465;
 
     return nodemailer.createTransport({
@@ -91,7 +93,10 @@ const getTransporter = () => {
       },
       tls: {
         rejectUnauthorized: false
-      }
+      },
+      connectionTimeout: 10000, // 10 seconds timeout
+      greetingTimeout: 10000,
+      socketTimeout: 15000
     });
   }
   return null;
