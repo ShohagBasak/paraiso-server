@@ -102,6 +102,8 @@ const allowedOrigins = [
   process.env.FRONTEND_URL
 ].filter(Boolean).map(url => url.replace(/\/$/, ''));
 
+const FRONTEND_BASE_URL = (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '');
+
 app.use(cors({ 
   origin: allowedOrigins, 
   credentials: true 
@@ -264,6 +266,98 @@ db.query(`
 `, (err) => {
   if (err) console.error("Error creating ticket_messages table:", err);
 });
+
+// ─── Initialize Notifications Table ───────────────────────
+db.query(`
+  CREATE TABLE IF NOT EXISTS notifications (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    title VARCHAR(255) NOT NULL,
+    message TEXT,
+    link VARCHAR(255) DEFAULT '',
+    is_read TINYINT(1) DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  )
+`, (err) => {
+  if (err) console.error("Error creating notifications table:", err);
+  else {
+    db.query("DELETE FROM notifications WHERE title LIKE 'New Staff Reply%'", (delErr) => {
+      if (!delErr) console.log("Cleaned existing staff reply notifications.");
+    });
+  }
+});
+
+// ─── Helper to Create & Send Notification (In-App + Email) ───
+const createAndSendNotification = ({ userId, title, message, link, emailSubject, emailHtml, skipInApp = false }) => {
+  if (!userId) return;
+
+  if (!skipInApp) {
+    db.query(
+      "INSERT INTO notifications (user_id, title, message, link) VALUES (?, ?, ?, ?)",
+      [userId, title, message, link || ''],
+      (err, result) => {
+        if (err) {
+          console.error("Error inserting notification:", err);
+        } else if (global.io) {
+          const notifData = {
+            id: result.insertId,
+            user_id: userId,
+            title,
+            message,
+            link: link || '',
+            is_read: 0,
+            created_at: new Date().toISOString()
+          };
+          global.io.to(`user-${userId}`).emit('new-notification', notifData);
+        }
+      }
+    );
+  }
+
+  // Async Email dispatch via Nodemailer if email payload provided
+  if (emailSubject && emailHtml) {
+    db.query("SELECT email FROM users WHERE id = ?", [userId], (err2, uRows) => {
+      if (!err2 && uRows && uRows.length > 0 && uRows[0].email) {
+        const transporter = getTransporter();
+        if (transporter && process.env.EMAIL_USER) {
+          const mailOptions = {
+            from: `"Paraiso Gaming Support" <${process.env.EMAIL_USER.trim()}>`,
+            to: uRows[0].email,
+            subject: emailSubject,
+            html: emailHtml
+          };
+          transporter.sendMail(mailOptions, (mailErr) => {
+            if (mailErr) console.error("Notification Email delivery error:", mailErr.message);
+          });
+        }
+      }
+    });
+  }
+};
+
+const notifyAllAdmins = ({ title, message, link, emailSubject, emailHtml }) => {
+  db.query(`
+    SELECT DISTINCT u.id 
+    FROM users u 
+    LEFT JOIN admin_permissions p ON p.user_id = u.id 
+    WHERE u.role = 'master' OR (u.role = 'admin' AND p.permission_key = 'tickets')
+  `, (err, admins) => {
+    if (!err && admins && admins.length > 0) {
+      admins.forEach(admin => {
+        createAndSendNotification({
+          userId: admin.id,
+          title,
+          message,
+          link,
+          emailSubject,
+          emailHtml
+        });
+      });
+    }
+  });
+};
+
 
 // ─── verifyToken Middleware ────────────────────────────────
 function verifyToken(req, res, next) {
@@ -3300,6 +3394,52 @@ app.post('/tickets', verifyToken, (req, res) => {
           global.io.to('admin-tickets').emit('new-ticket', { id: ticketId, item: item, user_id: req.user.id });
         }
 
+        // Send Email & In-App Notification to User
+        createAndSendNotification({
+          userId: req.user.id,
+          title: 'Ticket Created Successfully',
+          message: `Your purchase ticket for "${item.name}" has been created (#${ticketId}).`,
+          link: `/my-tickets/${ticketId}`,
+          emailSubject: `[Paraiso Gaming] Ticket #${ticketId} Opened - ${item.name}`,
+          emailHtml: `
+            <div style="font-family: Arial, sans-serif; background-color: #080d13; color: #ffffff; padding: 24px; border-radius: 12px; max-width: 600px; margin: 0 auto; border: 1px solid #1e293b;">
+              <h2 style="color: #06b6d4; margin-top: 0;">Paraiso Gaming Support</h2>
+              <p style="color: #cbd5e1;">Hello,</p>
+              <p style="color: #cbd5e1;">Your purchase ticket for <strong>${item.name}</strong> (x${qty}) has been opened successfully.</p>
+              <p style="color: #cbd5e1;">Ticket ID: <strong style="color: #06b6d4;">#${ticketId}</strong></p>
+              <div style="margin-top: 24px; text-align: center;">
+                <a href="${FRONTEND_BASE_URL}/my-tickets/${ticketId}" style="background-color: #06b6d4; color: #000000; font-weight: bold; text-decoration: none; padding: 12px 24px; border-radius: 8px; display: inline-block;">
+                  View Ticket & Chat
+                </a>
+              </div>
+              <p style="margin-top: 24px; color: #64748b; font-size: 12px; text-align: center;">Our staff team will review your request shortly.</p>
+            </div>
+          `
+        });
+
+        // Send Email & In-App Notification to All Eligible Admins (with tickets permission)
+        notifyAllAdmins({
+          title: `New Ticket #${ticketId}`,
+          message: `New ticket created for "${item.name}" by ${ingame_name.trim()}`,
+          link: `/dashboard/tickets?id=${ticketId}`,
+          emailSubject: `[Paraiso Gaming Admin] New Ticket #${ticketId} - ${item.name}`,
+          emailHtml: `
+            <div style="font-family: Arial, sans-serif; background-color: #080d13; color: #ffffff; padding: 24px; border-radius: 12px; max-width: 600px; margin: 0 auto; border: 1px solid #1e293b;">
+              <h2 style="color: #06b6d4; margin-top: 0;">New Ticket Created</h2>
+              <p style="color: #cbd5e1;">A new purchase ticket has been submitted on Paraiso Gaming.</p>
+              <p style="color: #cbd5e1;"><strong>Ticket ID:</strong> #${ticketId}</p>
+              <p style="color: #cbd5e1;"><strong>Item:</strong> ${item.name} (x${qty})</p>
+              <p style="color: #cbd5e1;"><strong>Ingame Name:</strong> ${ingame_name.trim()}</p>
+              <p style="color: #cbd5e1;"><strong>Discord:</strong> ${discord_username.trim()}</p>
+              <div style="margin-top: 24px; text-align: center;">
+                <a href="${FRONTEND_BASE_URL}/dashboard/tickets?id=${ticketId}" style="background-color: #06b6d4; color: #000000; font-weight: bold; text-decoration: none; padding: 12px 24px; border-radius: 8px; display: inline-block;">
+                  Open Admin Dashboard
+                </a>
+              </div>
+            </div>
+          `
+        });
+
         res.status(201).json({ message: 'Ticket created', id: ticketId });
       }
     );
@@ -3422,13 +3562,41 @@ app.put('/tickets/:id/claim', verifyToken, (req, res) => {
         global.io.to(`ticket-${req.params.id}`).emit('ticket-updated', { id: req.params.id, status: 'claimed', assigned_admin_id: req.user.id });
         global.io.to('admin-tickets').emit('ticket-updated', { id: req.params.id, status: 'claimed' });
       }
+
+      // Notify ticket owner that staff has claimed ticket
+      db.query("SELECT user_id FROM purchase_tickets WHERE id = ?", [req.params.id], (tErr, tRes) => {
+        if (!tErr && tRes && tRes.length > 0) {
+          db.query("SELECT username FROM users WHERE id = ?", [req.user.id], (uErr, uRes) => {
+            const staffName = (!uErr && uRes && uRes.length > 0) ? uRes[0].username : (req.user.username || 'Staff');
+            createAndSendNotification({
+              userId: tRes[0].user_id,
+              title: `Ticket #${req.params.id} Claimed`,
+              message: `Claimed by ${staffName}. They are now assisting you with your ticket.`,
+              link: `/my-tickets/${req.params.id}`,
+              emailSubject: `[Paraiso Gaming] Ticket #${req.params.id} Claimed by ${staffName}`,
+              emailHtml: `
+                <div style="font-family: Arial, sans-serif; background-color: #080d13; color: #ffffff; padding: 24px; border-radius: 12px; max-width: 600px; margin: 0 auto; border: 1px solid #1e293b;">
+                  <h2 style="color: #06b6d4; margin-top: 0;">Ticket Claimed</h2>
+                  <p style="color: #cbd5e1;">Staff member <strong>${staffName}</strong> has claimed your ticket <strong>#${req.params.id}</strong> and is now assisting you.</p>
+                  <div style="margin-top: 24px; text-align: center;">
+                    <a href="${FRONTEND_BASE_URL}/my-tickets/${req.params.id}" style="background-color: #06b6d4; color: #000000; font-weight: bold; text-decoration: none; padding: 12px 24px; border-radius: 8px; display: inline-block;">
+                      Open Ticket & Chat
+                    </a>
+                  </div>
+                </div>
+              `
+            });
+          });
+        }
+      });
+
       res.json({ message: 'Ticket claimed' });
     }
   );
 });
 
-// PUT /tickets/:id/assign — assign ticket to another admin
-app.put('/tickets/:id/assign', verifyToken, (req, res) => {
+// PUT /tickets/:id/assign — assign ticket to another admin (Master Admin only)
+app.put('/tickets/:id/assign', verifyMaster, (req, res) => {
   const { admin_id } = req.body;
   if (!admin_id) return res.status(400).json({ message: 'Admin ID is required' });
   db.query(
@@ -3442,6 +3610,28 @@ app.put('/tickets/:id/assign', verifyToken, (req, res) => {
         global.io.to(`ticket-${req.params.id}`).emit('ticket-updated', { id: req.params.id, status: 'claimed', assigned_admin_id: admin_id });
         global.io.to('admin-tickets').emit('ticket-updated', { id: req.params.id, status: 'claimed' });
       }
+
+      // Notify newly assigned admin
+      createAndSendNotification({
+        userId: admin_id,
+        title: `Ticket #${req.params.id} Assigned to You`,
+        message: `You have been assigned to handle Ticket #${req.params.id}.`,
+        link: `/dashboard/tickets?id=${req.params.id}`,
+        emailSubject: `[Paraiso Gaming Admin] Ticket #${req.params.id} Assigned to You`,
+        emailHtml: `
+          <div style="font-family: Arial, sans-serif; background-color: #080d13; color: #ffffff; padding: 24px; border-radius: 12px; max-width: 600px; margin: 0 auto; border: 1px solid #1e293b;">
+            <h2 style="color: #06b6d4; margin-top: 0;">Ticket Assignment</h2>
+            <p style="color: #cbd5e1;">Hello Admin,</p>
+            <p style="color: #cbd5e1;">You have been assigned to manage Ticket <strong>#${req.params.id}</strong>.</p>
+            <div style="margin-top: 24px; text-align: center;">
+              <a href="${FRONTEND_BASE_URL}/dashboard/tickets?id=${req.params.id}" style="background-color: #06b6d4; color: #000000; font-weight: bold; text-decoration: none; padding: 12px 24px; border-radius: 8px; display: inline-block;">
+                View Assigned Ticket
+              </a>
+            </div>
+          </div>
+        `
+      });
+
       res.json({ message: 'Ticket assigned' });
     }
   );
@@ -3531,13 +3721,20 @@ app.post('/tickets/:id/messages', verifyToken, (req, res) => {
   if (!message || !message.trim()) return res.status(400).json({ message: 'Message is required' });
   
   // Verify access
-  db.query("SELECT user_id, status FROM purchase_tickets WHERE id = ?", [req.params.id], (err, tResults) => {
+  db.query("SELECT user_id, assigned_admin_id, status FROM purchase_tickets WHERE id = ?", [req.params.id], (err, tResults) => {
     if (err || tResults.length === 0) return res.status(404).json({ message: 'Ticket not found' });
-    if (tResults[0].user_id !== req.user.id && req.user.role !== 'admin' && req.user.role !== 'master') {
+    const ticketOwnerId = tResults[0].user_id;
+    const assignedAdminId = tResults[0].assigned_admin_id;
+
+    if (ticketOwnerId !== req.user.id && req.user.role !== 'admin' && req.user.role !== 'master') {
       return res.status(403).json({ message: 'Access denied' });
     }
+    const isSenderStaff = req.user.role === 'admin' || req.user.role === 'master';
     if (tResults[0].status === 'closed') {
       return res.status(400).json({ message: 'Cannot send messages on a closed ticket' });
+    }
+    if (tResults[0].status === 'open' && isSenderStaff) {
+      return res.status(400).json({ message: 'You must claim or assign this ticket before sending messages.' });
     }
     
     db.query(
@@ -3566,11 +3763,134 @@ app.post('/tickets/:id/messages', verifyToken, (req, res) => {
           if (global.io) {
             global.io.to(`ticket-${req.params.id}`).emit('new-message', msgData);
           }
+
+          // Trigger Notification
+          const isSenderStaff = req.user.role === 'admin' || req.user.role === 'master';
+          const trimmedMsg = message.trim().slice(0, 60) + (message.trim().length > 60 ? '...' : '');
+
+          if (isSenderStaff) {
+            // Staff replied -> notify ticket owner via email only (skip in-app notification dropdown)
+            if (ticketOwnerId !== req.user.id) {
+              createAndSendNotification({
+                userId: ticketOwnerId,
+                title: `New Staff Reply on Ticket #${req.params.id}`,
+                message: `${msgData.sender_name}: "${trimmedMsg}"`,
+                link: `/my-tickets/${req.params.id}`,
+                emailSubject: `[Paraiso Gaming] New Reply on Ticket #${req.params.id}`,
+                emailHtml: `
+                  <div style="font-family: Arial, sans-serif; background-color: #080d13; color: #ffffff; padding: 24px; border-radius: 12px; max-width: 600px; margin: 0 auto; border: 1px solid #1e293b;">
+                    <h2 style="color: #06b6d4; margin-top: 0;">New Staff Response</h2>
+                    <p style="color: #cbd5e1;"><strong>${msgData.sender_name}</strong> replied on your Ticket <strong>#${req.params.id}</strong>:</p>
+                    <blockquote style="background-color: #0d1117; padding: 12px; border-left: 4px solid #06b6d4; color: #cbd5e1; border-radius: 6px;">
+                      ${message.trim()}
+                    </blockquote>
+                    <div style="margin-top: 24px; text-align: center;">
+                      <a href="${FRONTEND_BASE_URL}/my-tickets/${req.params.id}" style="background-color: #06b6d4; color: #000000; font-weight: bold; text-decoration: none; padding: 12px 24px; border-radius: 8px; display: inline-block;">
+                        View & Reply to Ticket
+                      </a>
+                    </div>
+                  </div>
+                `,
+                skipInApp: true
+              });
+            }
+          } else {
+            // User replied -> notify assigned admin or all admins with tickets permission
+            if (assignedAdminId) {
+              createAndSendNotification({
+                userId: assignedAdminId,
+                title: `New User Reply on Ticket #${req.params.id}`,
+                message: `${msgData.sender_name}: "${trimmedMsg}"`,
+                link: `/dashboard/tickets?id=${req.params.id}`,
+                emailSubject: `[Paraiso Gaming Admin] New Message on Ticket #${req.params.id}`,
+                emailHtml: `
+                  <div style="font-family: Arial, sans-serif; background-color: #080d13; color: #ffffff; padding: 24px; border-radius: 12px; max-width: 600px; margin: 0 auto; border: 1px solid #1e293b;">
+                    <h2 style="color: #06b6d4; margin-top: 0;">New User Reply</h2>
+                    <p style="color: #cbd5e1;"><strong>${msgData.sender_name}</strong> replied on Ticket <strong>#${req.params.id}</strong>:</p>
+                    <blockquote style="background-color: #0d1117; padding: 12px; border-left: 4px solid #06b6d4; color: #cbd5e1; border-radius: 6px;">
+                      ${message.trim()}
+                    </blockquote>
+                    <div style="margin-top: 24px; text-align: center;">
+                      <a href="${FRONTEND_BASE_URL}/dashboard/tickets?id=${req.params.id}" style="background-color: #06b6d4; color: #000000; font-weight: bold; text-decoration: none; padding: 12px 24px; border-radius: 8px; display: inline-block;">
+                        Open Admin Dashboard
+                      </a>
+                    </div>
+                  </div>
+                `
+              });
+            } else {
+              notifyAllAdmins({
+                title: `New User Reply on Ticket #${req.params.id}`,
+                message: `${msgData.sender_name}: "${trimmedMsg}"`,
+                link: `/dashboard/tickets?id=${req.params.id}`,
+                emailSubject: `[Paraiso Gaming Admin] New Message on Ticket #${req.params.id}`,
+                emailHtml: `
+                  <div style="font-family: Arial, sans-serif; background-color: #080d13; color: #ffffff; padding: 24px; border-radius: 12px; max-width: 600px; margin: 0 auto; border: 1px solid #1e293b;">
+                    <h2 style="color: #06b6d4; margin-top: 0;">New User Reply</h2>
+                    <p style="color: #cbd5e1;"><strong>${msgData.sender_name}</strong> replied on Ticket <strong>#${req.params.id}</strong>:</p>
+                    <blockquote style="background-color: #0d1117; padding: 12px; border-left: 4px solid #06b6d4; color: #cbd5e1; border-radius: 6px;">
+                      ${message.trim()}
+                    </blockquote>
+                    <div style="margin-top: 24px; text-align: center;">
+                      <a href="${FRONTEND_BASE_URL}/dashboard/tickets?id=${req.params.id}" style="background-color: #06b6d4; color: #000000; font-weight: bold; text-decoration: none; padding: 12px 24px; border-radius: 8px; display: inline-block;">
+                        Open Admin Dashboard
+                      </a>
+                    </div>
+                  </div>
+                `
+              });
+            }
+          }
+
           res.status(201).json(msgData);
         });
       }
     );
   });
+});
+
+// ─── NOTIFICATION API ENDPOINTS ──────────────────────────────
+// GET /notifications — get user notifications
+app.get('/notifications', verifyToken, (req, res) => {
+  db.query(
+    "SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 30",
+    [req.user.id],
+    (err, results) => {
+      if (err) return res.status(500).json({ message: 'Failed to fetch notifications' });
+      db.query(
+        "SELECT COUNT(*) as unreadCount FROM notifications WHERE user_id = ? AND is_read = 0",
+        [req.user.id],
+        (err2, countRes) => {
+          const unreadCount = (!err2 && countRes && countRes[0]) ? countRes[0].unreadCount : 0;
+          res.json({ notifications: results, unreadCount });
+        }
+      );
+    }
+  );
+});
+
+// PUT /notifications/:id/read — mark single notification read
+app.put('/notifications/:id/read', verifyToken, (req, res) => {
+  db.query(
+    "UPDATE notifications SET is_read = 1 WHERE id = ? AND user_id = ?",
+    [req.params.id, req.user.id],
+    (err) => {
+      if (err) return res.status(500).json({ message: 'Failed to update notification' });
+      res.json({ message: 'Marked as read' });
+    }
+  );
+});
+
+// PUT /notifications/read-all — mark all notifications read
+app.put('/notifications/read-all', verifyToken, (req, res) => {
+  db.query(
+    "UPDATE notifications SET is_read = 1 WHERE user_id = ?",
+    [req.user.id],
+    (err) => {
+      if (err) return res.status(500).json({ message: 'Failed to update notifications' });
+      res.json({ message: 'All marked as read' });
+    }
+  );
 });
 
 // GET /admins — list admin/master users (for ticket assignment dropdown)
@@ -3611,6 +3931,9 @@ io.use((socket, next) => {
 
 io.on('connection', (socket) => {
   console.log(`Socket connected: ${socket.user.id} (${socket.user.role})`);
+  
+  // Join user's personal notification room
+  socket.join(`user-${socket.user.id}`);
   
   // Admin joins the admin-tickets room for real-time notifications
   if (socket.user.role === 'admin' || socket.user.role === 'master') {
