@@ -329,7 +329,7 @@ const createAndSendNotification = ({ userId, title, message, link, emailSubject,
         // 1. Try Brevo HTTP API (Port 443 - Never blocked on Render)
         if (process.env.BREVO_API_KEY) {
           try {
-            await httpsPost(
+            const res = await httpsPost(
               'https://api.brevo.com/v3/smtp/email',
               {
                 'accept': 'application/json',
@@ -337,13 +337,19 @@ const createAndSendNotification = ({ userId, title, message, link, emailSubject,
                 'content-type': 'application/json'
               },
               JSON.stringify({
-                sender: { name: "Paraiso Gaming Support", email: process.env.EMAIL_USER || "noreply@paraisogaming.com" },
+                sender: { name: "Paraiso Gaming Support", email: (process.env.EMAIL_USER || "noreply@paraisogaming.com").trim() },
                 to: [{ email: toEmail }],
                 subject: emailSubject,
                 htmlContent: emailHtml
               })
             );
-            return;
+            if (res.ok) {
+              console.log("Notification Email sent via Brevo API to", toEmail);
+              return;
+            } else {
+              const errBody = await res.json();
+              console.error("Brevo API Delivery Error:", res.status, JSON.stringify(errBody));
+            }
           } catch (e) {
             console.error("Notification Email via Brevo error:", e.message);
           }
@@ -352,7 +358,7 @@ const createAndSendNotification = ({ userId, title, message, link, emailSubject,
         // 2. Try Resend HTTP API (Port 443 - Never blocked on Render)
         if (process.env.RESEND_API_KEY) {
           try {
-            await httpsPost(
+            const res = await httpsPost(
               'https://api.resend.com/emails',
               {
                 'Authorization': `Bearer ${process.env.RESEND_API_KEY.trim()}`,
@@ -365,7 +371,13 @@ const createAndSendNotification = ({ userId, title, message, link, emailSubject,
                 html: emailHtml
               })
             );
-            return;
+            if (res.ok) {
+              console.log("Notification Email sent via Resend API to", toEmail);
+              return;
+            } else {
+              const errBody = await res.json();
+              console.error("Resend API Delivery Error:", res.status, JSON.stringify(errBody));
+            }
           } catch (e) {
             console.error("Notification Email via Resend error:", e.message);
           }
@@ -2113,6 +2125,55 @@ app.get('/page-settings/govt-header', (req, res) => {
       if (err2) console.error("Error inserting default header:", err2);
       return res.json(JSON.parse(defaultHeader));
     });
+  });
+});
+
+// ─── Server Info (Server IP, Discord URL & Status) ────────────────
+app.get('/server-info', (req, res) => {
+  const defaultInfo = {
+    server_ip: 'Coming Soon...',
+    discord_url: 'https://discord.gg/7AsJaG3KSV',
+    status: 'online'
+  };
+
+  db.query("SELECT content FROM page_contents WHERE page_key = 'server-info'", (err, results) => {
+    if (err) return res.status(500).json({ message: 'DB error', error: err });
+    if (results && results.length > 0 && results[0].content) {
+      try {
+        const parsed = JSON.parse(results[0].content);
+        return res.json({
+          server_ip: parsed.server_ip || 'Coming Soon...',
+          discord_url: parsed.discord_url || 'https://discord.gg/7AsJaG3KSV',
+          status: parsed.status || 'online'
+        });
+      } catch {
+        return res.json(defaultInfo);
+      }
+    }
+    return res.json(defaultInfo);
+  });
+});
+
+app.put('/server-info', verifyToken, (req, res) => {
+  if (req.user.role !== 'admin' && req.user.role !== 'master') {
+    return res.status(403).json({ message: 'Access denied' });
+  }
+
+  const { server_ip, discord_url, status } = req.body;
+  const infoJson = JSON.stringify({
+    server_ip: server_ip || 'Coming Soon...',
+    discord_url: discord_url || 'https://discord.gg/7AsJaG3KSV',
+    status: status || 'online'
+  });
+
+  const sql = `
+    INSERT INTO page_contents (page_key, content) 
+    VALUES ('server-info', ?) 
+    ON DUPLICATE KEY UPDATE content = ?
+  `;
+  db.query(sql, [infoJson, infoJson], (err) => {
+    if (err) return res.status(500).json({ message: 'Failed to save server info', error: err });
+    res.json({ message: 'Server info updated successfully', server_ip, discord_url, status });
   });
 });
 
