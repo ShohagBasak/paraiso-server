@@ -290,6 +290,20 @@ db.query(`
     db.query("DELETE FROM notifications WHERE title LIKE 'New Staff Reply%'", (delErr) => {
       if (!delErr) console.log("Cleaned existing staff reply notifications.");
     });
+    // Cleanup any orphaned ticket notifications where ticket no longer exists
+    db.query(
+      `DELETE FROM notifications 
+       WHERE (link LIKE '%id=%' OR link LIKE '%/my-tickets/%' OR title LIKE '%Ticket #%')
+       AND NOT EXISTS (
+         SELECT 1 FROM purchase_tickets t 
+         WHERE notifications.link REGEXP CONCAT('[?&]id=', t.id, '([&]|$)')
+            OR notifications.link REGEXP CONCAT('/my-tickets/', t.id, '(/|$)')
+            OR notifications.title REGEXP CONCAT('#', t.id, '([^0-9]|$)')
+       )`,
+      (delErr) => {
+        if (!delErr) console.log("Cleaned notifications for deleted tickets.");
+      }
+    );
   }
 });
 
@@ -3794,12 +3808,27 @@ app.delete('/tickets/:id', verifyToken, (req, res) => {
       return res.status(403).json({ message: 'Access denied. Only admins can delete tickets.' });
     }
 
-    db.query("DELETE FROM purchase_tickets WHERE id = ?", [req.params.id], (err2, result) => {
+    const ticketId = parseInt(req.params.id, 10);
+    db.query("DELETE FROM purchase_tickets WHERE id = ?", [ticketId], (err2, result) => {
       if (err2) return res.status(500).json({ message: 'Failed to delete ticket' });
       if (result.affectedRows === 0) return res.status(404).json({ message: 'Ticket not found' });
+
+      // Delete all notifications linked to this ticket from DB
+      db.query(
+        "DELETE FROM notifications WHERE link REGEXP ? OR link REGEXP ? OR title REGEXP ?",
+        [
+          `[?&]id=${ticketId}([&]|$)`,
+          `/my-tickets/${ticketId}(/|$)`,
+          `#${ticketId}([^0-9]|$)`
+        ],
+        (notifErr) => {
+          if (notifErr) console.error("Error deleting notifications for ticket:", notifErr);
+        }
+      );
+
       if (global.io) {
-        global.io.to(`ticket-${req.params.id}`).emit('ticket-deleted', { id: req.params.id });
-        global.io.to('admin-tickets').emit('ticket-updated', { id: req.params.id });
+        global.io.emit('ticket-deleted', { id: ticketId });
+        global.io.to('admin-tickets').emit('ticket-updated', { id: ticketId });
       }
       res.json({ message: 'Ticket deleted successfully' });
     });
