@@ -320,15 +320,63 @@ const createAndSendNotification = ({ userId, title, message, link, emailSubject,
     );
   }
 
-  // Async Email dispatch via Nodemailer if email payload provided
+  // Async Email dispatch via HTTP API (Brevo / Resend) or Nodemailer SMTP fallback
   if (emailSubject && emailHtml) {
-    db.query("SELECT email FROM users WHERE id = ?", [userId], (err2, uRows) => {
+    db.query("SELECT email FROM users WHERE id = ?", [userId], async (err2, uRows) => {
       if (!err2 && uRows && uRows.length > 0 && uRows[0].email) {
+        const toEmail = uRows[0].email;
+
+        // 1. Try Brevo HTTP API (Port 443 - Never blocked on Render)
+        if (process.env.BREVO_API_KEY) {
+          try {
+            await httpsPost(
+              'https://api.brevo.com/v3/smtp/email',
+              {
+                'accept': 'application/json',
+                'api-key': process.env.BREVO_API_KEY.trim(),
+                'content-type': 'application/json'
+              },
+              JSON.stringify({
+                sender: { name: "Paraiso Gaming Support", email: process.env.EMAIL_USER || "noreply@paraisogaming.com" },
+                to: [{ email: toEmail }],
+                subject: emailSubject,
+                htmlContent: emailHtml
+              })
+            );
+            return;
+          } catch (e) {
+            console.error("Notification Email via Brevo error:", e.message);
+          }
+        }
+
+        // 2. Try Resend HTTP API (Port 443 - Never blocked on Render)
+        if (process.env.RESEND_API_KEY) {
+          try {
+            await httpsPost(
+              'https://api.resend.com/emails',
+              {
+                'Authorization': `Bearer ${process.env.RESEND_API_KEY.trim()}`,
+                'Content-Type': 'application/json'
+              },
+              JSON.stringify({
+                from: process.env.EMAIL_FROM || 'Paraiso Gaming <onboarding@resend.dev>',
+                to: toEmail,
+                subject: emailSubject,
+                html: emailHtml
+              })
+            );
+            return;
+          } catch (e) {
+            console.error("Notification Email via Resend error:", e.message);
+          }
+        }
+
+        // 3. Fallback to Nodemailer SMTP
         const transporter = getTransporter();
         if (transporter && process.env.EMAIL_USER) {
           const mailOptions = {
             from: `"Paraiso Gaming Support" <${process.env.EMAIL_USER.trim()}>`,
-            to: uRows[0].email,
+            to: toEmail,
             subject: emailSubject,
             html: emailHtml
           };
