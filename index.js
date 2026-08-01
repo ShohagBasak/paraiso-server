@@ -2162,7 +2162,7 @@ app.get('/server-info', (req, res) => {
     status: 'online'
   };
 
-  db.query("SELECT content FROM page_contents WHERE page_key = 'server-info'", (err, results) => {
+  db.query("SELECT content FROM page_contents WHERE page_key = 'server-info' ORDER BY updated_at DESC LIMIT 1", (err, results) => {
     if (err) return res.json(defaultInfo);
     if (results && results.length > 0 && results[0].content) {
       try {
@@ -2206,17 +2206,15 @@ app.put('/server-info', verifyToken, (req, res) => {
       return res.status(500).json({ message: 'Database error ensuring page_contents table', error: err });
     }
 
-    const sql = `
-      INSERT INTO page_contents (page_key, content) 
-      VALUES ('server-info', ?) 
-      ON DUPLICATE KEY UPDATE content = ?
-    `;
-    db.query(sql, [infoJson, infoJson], (err2) => {
-      if (err2) {
-        console.error("Error updating server info in DB:", err2);
-        return res.status(500).json({ message: 'Failed to save server info', error: err2 });
-      }
-      res.json({ message: 'Server info updated successfully', server_ip, discord_url, status });
+    // Clean existing duplicates & insert latest info
+    db.query("DELETE FROM page_contents WHERE page_key = 'server-info'", (delErr) => {
+      db.query("INSERT INTO page_contents (page_key, content) VALUES ('server-info', ?)", [infoJson], (err2) => {
+        if (err2) {
+          console.error("Error updating server info in DB:", err2);
+          return res.status(500).json({ message: 'Failed to save server info', error: err2 });
+        }
+        res.json({ message: 'Server info updated successfully', server_ip, discord_url, status });
+      });
     });
   });
 });
