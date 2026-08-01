@@ -200,6 +200,17 @@ db.query(`
   }
 });
 
+// ─── Initialize Page Contents Table ───────────────────────
+db.query(`
+  CREATE TABLE IF NOT EXISTS page_contents (
+    page_key VARCHAR(100) PRIMARY KEY,
+    content LONGTEXT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+  )
+`, (err) => {
+  if (err) console.error("Error creating page_contents table:", err);
+});
+
 // ─── Initialize Donate Categories Table ───────────────────
 db.query(`
   CREATE TABLE IF NOT EXISTS donate_categories (
@@ -2144,6 +2155,7 @@ app.get('/page-settings/govt-header', (req, res) => {
 
 // ─── Server Info (Server IP, Discord URL & Status) ────────────────
 app.get('/server-info', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
   const defaultInfo = {
     server_ip: 'Coming Soon...',
     discord_url: 'https://discord.gg/7AsJaG3KSV',
@@ -2151,7 +2163,7 @@ app.get('/server-info', (req, res) => {
   };
 
   db.query("SELECT content FROM page_contents WHERE page_key = 'server-info'", (err, results) => {
-    if (err) return res.status(500).json({ message: 'DB error', error: err });
+    if (err) return res.json(defaultInfo);
     if (results && results.length > 0 && results[0].content) {
       try {
         const parsed = JSON.parse(results[0].content);
@@ -2180,14 +2192,32 @@ app.put('/server-info', verifyToken, (req, res) => {
     status: status || 'online'
   });
 
-  const sql = `
-    INSERT INTO page_contents (page_key, content) 
-    VALUES ('server-info', ?) 
-    ON DUPLICATE KEY UPDATE content = ?
+  const createTableSql = `
+    CREATE TABLE IF NOT EXISTS page_contents (
+      page_key VARCHAR(100) PRIMARY KEY,
+      content LONGTEXT NULL,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    );
   `;
-  db.query(sql, [infoJson, infoJson], (err) => {
-    if (err) return res.status(500).json({ message: 'Failed to save server info', error: err });
-    res.json({ message: 'Server info updated successfully', server_ip, discord_url, status });
+
+  db.query(createTableSql, (err) => {
+    if (err) {
+      console.error("Error creating page_contents table in PUT /server-info:", err);
+      return res.status(500).json({ message: 'Database error ensuring page_contents table', error: err });
+    }
+
+    const sql = `
+      INSERT INTO page_contents (page_key, content) 
+      VALUES ('server-info', ?) 
+      ON DUPLICATE KEY UPDATE content = ?
+    `;
+    db.query(sql, [infoJson, infoJson], (err2) => {
+      if (err2) {
+        console.error("Error updating server info in DB:", err2);
+        return res.status(500).json({ message: 'Failed to save server info', error: err2 });
+      }
+      res.json({ message: 'Server info updated successfully', server_ip, discord_url, status });
+    });
   });
 });
 
