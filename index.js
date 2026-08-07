@@ -283,6 +283,21 @@ db.query(`
   if (err) console.error("Error creating ticket_messages table:", err);
 });
 
+// ─── Initialize Ticket Items Table (Multiple items per ticket) ───
+db.query(`
+  CREATE TABLE IF NOT EXISTS ticket_items (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    ticket_id INT NOT NULL,
+    item_id INT NOT NULL,
+    quantity INT DEFAULT 1,
+    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (ticket_id) REFERENCES purchase_tickets(id) ON DELETE CASCADE,
+    FOREIGN KEY (item_id) REFERENCES donate_items(id) ON DELETE CASCADE
+  )
+`, (err) => {
+  if (err) console.error("Error creating ticket_items table:", err);
+});
+
 // ─── Initialize Notifications Table ───────────────────────
 db.query(`
   CREATE TABLE IF NOT EXISTS notifications (
@@ -3545,6 +3560,13 @@ app.post('/tickets', verifyToken, (req, res) => {
           () => {} // fire and forget
         );
 
+        // Also insert first item into ticket_items table
+        db.query(
+          "INSERT INTO ticket_items (ticket_id, item_id, quantity) VALUES (?, ?, ?)",
+          [ticketId, item_id, qty],
+          () => {} // fire and forget
+        );
+
         // Notify admins via Socket.IO
         if (global.io) {
           global.io.to('admin-tickets').emit('new-ticket', { id: ticketId, item: item, user_id: req.user.id });
@@ -3602,6 +3624,289 @@ app.post('/tickets', verifyToken, (req, res) => {
   });
 });
 
+// POST /tickets/:id/items — authenticated user: add another item to existing ticket
+app.post('/tickets/:id/items', verifyToken, (req, res) => {
+  const { item_id, quantity } = req.body;
+  if (!item_id) return res.status(400).json({ message: 'Item ID is required' });
+  const qty = Math.max(1, parseInt(quantity) || 1);
+
+  // Verify ticket exists and user owns it
+  db.query("SELECT * FROM purchase_tickets WHERE id = ?", [req.params.id], (err, tickets) => {
+    if (err || tickets.length === 0) return res.status(404).json({ message: 'Ticket not found' });
+    const ticket = tickets[0];
+
+    if (ticket.user_id !== req.user.id) {
+      return res.status(403).json({ message: 'You can only add items to your own tickets' });
+    }
+    if (ticket.status === 'closed') {
+      return res.status(400).json({ message: 'Cannot add items to a closed ticket' });
+    }
+
+    // Verify item exists and is active
+    db.query("SELECT id, name, price FROM donate_items WHERE id = ? AND is_active = 1", [item_id], (err2, items) => {
+      if (err2 || items.length === 0) return res.status(404).json({ message: 'Item not found or inactive' });
+      const item = items[0];
+      const unitPrice = parseFloat(item.price);
+      const totalPrice = (unitPrice * qty).toFixed(2);
+
+      // Insert into ticket_items
+      db.query(
+        "INSERT INTO ticket_items (ticket_id, item_id, quantity) VALUES (?, ?, ?)",
+        [req.params.id, item_id, qty],
+        (err3, result) => {
+          if (err3) return res.status(500).json({ message: 'Failed to add item' });
+
+          // Auto-message in ticket chat
+          const autoMsg = `➕ New Item Added to Ticket:\n• Item: ${item.name}\n• Unit Price: $${unitPrice.toFixed(2)}\n• Quantity: ${qty}\n• Subtotal: $${totalPrice}`;
+          db.query(
+            "INSERT INTO ticket_messages (ticket_id, sender_id, message) VALUES (?, ?, ?)",
+            [req.params.id, req.user.id, autoMsg],
+            (msgErr, msgResult) => {
+              // Broadcast new message via socket
+              if (!msgErr && global.io) {
+                db.query("SELECT username, role FROM users WHERE id = ?", [req.user.id], (uErr, uRes) => {
+                  const senderName = (!uErr && uRes && uRes.length > 0) ? uRes[0].username : 'Unknown';
+                  const senderRole = (!uErr && uRes && uRes.length > 0) ? uRes[0].role : 'user';
+                  global.io.to(`ticket-${req.params.id}`).emit('new-message', {
+                    id: msgResult.insertId,
+                    ticket_id: parseInt(req.params.id),
+                    sender_id: req.user.id,
+                    sender_name: senderName,
+                    sender_role: senderRole,
+                    message: autoMsg,
+                    created_at: new Date().toISOString()
+                  });
+                });
+              }
+            }
+          );
+
+          // Emit socket event for item added
+          if (global.io) {
+            global.io.to(`ticket-${req.params.id}`).emit('ticket-item-added', {
+              ticketId: parseInt(req.params.id),
+              item: { ...item, quantity: qty }
+            });
+            global.io.to('admin-tickets').emit('ticket-item-added', {
+              ticketId: parseInt(req.params.id),
+              item: { ...item, quantity: qty }
+            });
+          }
+
+          // Notify assigned admin or all admins
+          const notifData = {
+            title: `Item Added to Ticket #${req.params.id}`,
+            message: `"${item.name}" (x${qty}) was added to Ticket #${req.params.id}`,
+            link: `/dashboard/tickets?id=${req.params.id}`,
+            emailSubject: `[Paraiso Gaming Admin] Item Added to Ticket #${req.params.id}`,
+            emailHtml: `
+              <div style="font-family: Arial, sans-serif; background-color: #080d13; color: #ffffff; padding: 24px; border-radius: 12px; max-width: 600px; margin: 0 auto; border: 1px solid #1e293b;">
+                <h2 style="color: #06b6d4; margin-top: 0;">Item Added to Ticket</h2>
+                <p style="color: #cbd5e1;">A new item has been added to <strong>Ticket #${req.params.id}</strong>.</p>
+                <p style="color: #cbd5e1;"><strong>Item:</strong> ${item.name} (x${qty})</p>
+                <p style="color: #cbd5e1;"><strong>Subtotal:</strong> $${totalPrice}</p>
+                <div style="margin-top: 24px; text-align: center;">
+                  <a href="${FRONTEND_BASE_URL}/dashboard/tickets?id=${req.params.id}" style="background-color: #06b6d4; color: #000000; font-weight: bold; text-decoration: none; padding: 12px 24px; border-radius: 8px; display: inline-block;">View Ticket</a>
+                </div>
+              </div>
+            `
+          };
+
+          if (ticket.assigned_admin_id) {
+            createAndSendNotification({ userId: ticket.assigned_admin_id, ...notifData });
+          } else {
+            notifyAllAdmins(notifData);
+          }
+
+          res.status(201).json({ message: 'Item added to ticket', id: result.insertId, item_name: item.name });
+        }
+      );
+    });
+  });
+});
+
+// PUT /tickets/:ticketId/items/:itemId — edit item quantity or item in ticket
+app.put('/tickets/:ticketId/items/:itemId', verifyToken, (req, res) => {
+  const { quantity, item_id } = req.body;
+  const newQty = Math.max(1, parseInt(quantity) || 1);
+  const ticketId = req.params.ticketId;
+  const ticketItemId = req.params.itemId;
+
+  db.query("SELECT * FROM purchase_tickets WHERE id = ?", [ticketId], (err, tickets) => {
+    if (err || tickets.length === 0) return res.status(404).json({ message: 'Ticket not found' });
+    const ticket = tickets[0];
+    const isOwner = ticket.user_id === req.user.id;
+    const isAdmin = req.user.role === 'admin' || req.user.role === 'master';
+
+    if (!isOwner && !isAdmin) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+    if (ticket.status === 'closed') {
+      return res.status(400).json({ message: 'Cannot modify items on a closed ticket' });
+    }
+
+    db.query("SELECT ti.*, di.name as old_name FROM ticket_items ti LEFT JOIN donate_items di ON di.id = ti.item_id WHERE ti.id = ? AND ti.ticket_id = ?", [ticketItemId, ticketId], (err2, tiRows) => {
+      if (err2 || tiRows.length === 0) return res.status(404).json({ message: 'Ticket item not found' });
+      const currentTi = tiRows[0];
+      const targetItemId = item_id ? parseInt(item_id) : currentTi.item_id;
+
+      db.query("SELECT id, name, price FROM donate_items WHERE id = ?", [targetItemId], (err3, diRows) => {
+        if (err3 || diRows.length === 0) return res.status(404).json({ message: 'Store item not found' });
+        const newItem = diRows[0];
+
+        db.query(
+          "UPDATE ticket_items SET item_id = ?, quantity = ? WHERE id = ?",
+          [targetItemId, newQty, ticketItemId],
+          (err4) => {
+            if (err4) return res.status(500).json({ message: 'Failed to update ticket item' });
+
+            const autoMsg = `✏️ Ticket Item Updated:\n• Item: ${newItem.name}\n• Quantity: ${newQty}\n• Subtotal: $${(parseFloat(newItem.price) * newQty).toFixed(2)}`;
+            const msgPattern = `✏️ Ticket Item Updated:\n• Item: ${newItem.name}%`;
+
+            db.query(
+              "SELECT id FROM ticket_messages WHERE ticket_id = ? AND message LIKE ? ORDER BY id DESC LIMIT 1",
+              [ticketId, msgPattern],
+              (findErr, findRows) => {
+                if (!findErr && findRows && findRows.length > 0) {
+                  const existingMsgId = findRows[0].id;
+                  db.query(
+                    "UPDATE ticket_messages SET message = ? WHERE id = ?",
+                    [autoMsg, existingMsgId],
+                    () => {
+                      if (global.io) {
+                        global.io.to(`ticket-${ticketId}`).emit('ticket-item-updated', { ticketId: parseInt(ticketId), itemId: ticketItemId });
+                        global.io.to('admin-tickets').emit('ticket-item-updated', { ticketId: parseInt(ticketId), itemId: ticketItemId });
+                      }
+                    }
+                  );
+                } else {
+                  db.query("INSERT INTO ticket_messages (ticket_id, sender_id, message) VALUES (?, ?, ?)", [ticketId, req.user.id, autoMsg], (mErr, mRes) => {
+                    if (!mErr && global.io) {
+                      db.query("SELECT username, role FROM users WHERE id = ?", [req.user.id], (uErr, uRes) => {
+                        const senderName = (!uErr && uRes && uRes.length > 0) ? uRes[0].username : 'Unknown';
+                        const senderRole = (!uErr && uRes && uRes.length > 0) ? uRes[0].role : 'user';
+                        global.io.to(`ticket-${ticketId}`).emit('new-message', {
+                          id: mRes.insertId,
+                          ticket_id: parseInt(ticketId),
+                          sender_id: req.user.id,
+                          sender_name: senderName,
+                          sender_role: senderRole,
+                          message: autoMsg,
+                          created_at: new Date().toISOString()
+                        });
+                      });
+                    }
+                    if (global.io) {
+                      global.io.to(`ticket-${ticketId}`).emit('ticket-item-updated', { ticketId: parseInt(ticketId), itemId: ticketItemId });
+                      global.io.to('admin-tickets').emit('ticket-item-updated', { ticketId: parseInt(ticketId), itemId: ticketItemId });
+                    }
+                  });
+                }
+              }
+            );
+
+            res.json({ message: 'Ticket item updated successfully' });
+          }
+        );
+      });
+    });
+  });
+});
+
+// DELETE /tickets/:ticketId/items/:itemId — remove item from ticket
+app.delete('/tickets/:ticketId/items/:itemId', verifyToken, (req, res) => {
+  const ticketId = req.params.ticketId;
+  const ticketItemId = req.params.itemId;
+
+  db.query("SELECT * FROM purchase_tickets WHERE id = ?", [ticketId], (err, tickets) => {
+    if (err || tickets.length === 0) return res.status(404).json({ message: 'Ticket not found' });
+    const ticket = tickets[0];
+    const isOwner = ticket.user_id === req.user.id;
+    const isAdmin = req.user.role === 'admin' || req.user.role === 'master';
+
+    if (!isOwner && !isAdmin) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+    if (ticket.status === 'closed') {
+      return res.status(400).json({ message: 'Cannot modify items on a closed ticket' });
+    }
+
+    db.query("SELECT ti.*, di.name as item_name FROM ticket_items ti LEFT JOIN donate_items di ON di.id = ti.item_id WHERE ti.ticket_id = ?", [ticketId], (err2, items) => {
+      if (err2 || items.length === 0) return res.status(404).json({ message: 'No items in ticket' });
+      if (items.length <= 1) {
+        return res.status(400).json({ message: 'A ticket must have at least one item' });
+      }
+
+      const targetItem = items.find(i => i.id == ticketItemId);
+      if (!targetItem) return res.status(404).json({ message: 'Item not found in ticket' });
+
+      db.query("DELETE FROM ticket_items WHERE id = ?", [ticketItemId], (err3) => {
+        if (err3) return res.status(500).json({ message: 'Failed to remove item' });
+
+        if (global.io) {
+          global.io.to(`ticket-${ticketId}`).emit('ticket-item-deleted', { ticketId: parseInt(ticketId), itemId: ticketItemId });
+          global.io.to('admin-tickets').emit('ticket-item-deleted', { ticketId: parseInt(ticketId), itemId: ticketItemId });
+        }
+
+        res.json({ message: 'Item removed from ticket' });
+      });
+    });
+  });
+});
+
+// GET /tickets/:id/items — get all items for a ticket
+app.get('/tickets/:id/items', verifyToken, (req, res) => {
+  // Verify access
+  db.query("SELECT user_id FROM purchase_tickets WHERE id = ?", [req.params.id], (err, tResults) => {
+    if (err || tResults.length === 0) return res.status(404).json({ message: 'Ticket not found' });
+    if (tResults[0].user_id !== req.user.id && req.user.role !== 'admin' && req.user.role !== 'master') {
+      // Check admin permission
+      return db.query("SELECT 1 FROM admin_permissions WHERE user_id = ? AND permission_key = 'tickets'", [req.user.id], (err2, permRows) => {
+        if (err2 || !permRows || permRows.length === 0) {
+          return res.status(403).json({ message: 'Access denied' });
+        }
+        fetchTicketItems();
+      });
+    }
+    fetchTicketItems();
+  });
+
+  function fetchTicketItems() {
+    db.query(
+      `SELECT ti.*, di.name as item_name, di.price as item_price, di.image_url as item_image, di.description as item_description
+       FROM ticket_items ti
+       LEFT JOIN donate_items di ON di.id = ti.item_id
+       WHERE ti.ticket_id = ?
+       ORDER BY ti.added_at ASC`,
+      [req.params.id],
+      (err2, results) => {
+        if (err2) return res.status(500).json({ message: 'Failed to fetch ticket items' });
+        if (results.length === 0) {
+          db.query("SELECT item_id, quantity FROM purchase_tickets WHERE id = ?", [req.params.id], (err3, pRes) => {
+            if (!err3 && pRes && pRes.length > 0 && pRes[0].item_id) {
+              db.query("INSERT INTO ticket_items (ticket_id, item_id, quantity) VALUES (?, ?, ?)", [req.params.id, pRes[0].item_id, pRes[0].quantity || 1], () => {
+                db.query(
+                  `SELECT ti.*, di.name as item_name, di.price as item_price, di.image_url as item_image, di.description as item_description
+                   FROM ticket_items ti
+                   LEFT JOIN donate_items di ON di.id = ti.item_id
+                   WHERE ti.ticket_id = ?
+                   ORDER BY ti.added_at ASC`,
+                  [req.params.id],
+                  (err4, resSync) => res.json(resSync || [])
+                );
+              });
+            } else {
+              res.json([]);
+            }
+          });
+        } else {
+          res.json(results);
+        }
+      }
+    );
+  }
+});
+
 // GET /tickets — list tickets (master & global permission admins get all, assigned admins get assigned tickets)
 app.get('/tickets', verifyToken, (req, res) => {
   const { status } = req.query;
@@ -3657,7 +3962,8 @@ app.get('/tickets/my', verifyToken, (req, res) => {
   db.query(
     `SELECT t.*, 
       i.name as item_name, i.price as item_price, i.image_url as item_image,
-      a.username as admin_name
+      a.username as admin_name,
+      (SELECT COUNT(*) FROM ticket_items ti WHERE ti.ticket_id = t.id) as item_count
       FROM purchase_tickets t
       LEFT JOIN donate_items i ON i.id = t.item_id
       LEFT JOIN users a ON a.id = t.assigned_admin_id
@@ -4018,6 +4324,42 @@ app.post('/tickets/:id/messages', verifyToken, (req, res) => {
       }
     );
   });
+});
+
+// DELETE /tickets/:ticketId/messages/:messageId — delete chat message
+app.delete('/tickets/:ticketId/messages/:messageId', verifyToken, (req, res) => {
+  const { ticketId, messageId } = req.params;
+
+  db.query(
+    "SELECT m.*, t.user_id as ticket_owner_id FROM ticket_messages m LEFT JOIN purchase_tickets t ON t.id = m.ticket_id WHERE m.id = ? AND m.ticket_id = ?",
+    [messageId, ticketId],
+    (err, results) => {
+      if (err || !results || results.length === 0) {
+        return res.status(404).json({ message: 'Message not found' });
+      }
+      const msg = results[0];
+      const isSender = msg.sender_id === req.user.id;
+      const isOwner = msg.ticket_owner_id === req.user.id;
+      const isAdmin = req.user.role === 'admin' || req.user.role === 'master';
+
+      if (!isSender && !isOwner && !isAdmin) {
+        return res.status(403).json({ message: 'Access denied. You cannot delete this message.' });
+      }
+
+      db.query("DELETE FROM ticket_messages WHERE id = ?", [messageId], (err2) => {
+        if (err2) return res.status(500).json({ message: 'Failed to delete message' });
+
+        if (global.io) {
+          global.io.to(`ticket-${ticketId}`).emit('message-deleted', {
+            messageId: parseInt(messageId),
+            ticketId: parseInt(ticketId)
+          });
+        }
+
+        res.json({ message: 'Message deleted successfully' });
+      });
+    }
+  );
 });
 
 // ─── NOTIFICATION API ENDPOINTS ──────────────────────────────
