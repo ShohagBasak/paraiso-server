@@ -4511,6 +4511,31 @@ function verifyUcpToken(req, res, next) {
   return res.status(403).json({ message: 'Invalid or expired UCP session' });
 }
 
+// UCP Active Logged-in Devices Session Tracker
+const ucpActiveSessions = new Map();
+
+function parseUserAgent(ua) {
+  if (!ua) return { browser: 'Browser', os: 'Desktop OS', deviceType: 'Desktop' };
+  let browser = 'Chrome';
+  if (ua.includes('Edg/')) browser = 'Microsoft Edge';
+  else if (ua.includes('OPR/') || ua.includes('Opera')) browser = 'Opera';
+  else if (ua.includes('Chrome/')) browser = 'Google Chrome';
+  else if (ua.includes('Safari/') && !ua.includes('Chrome')) browser = 'Safari';
+  else if (ua.includes('Firefox/')) browser = 'Mozilla Firefox';
+
+  let os = 'Windows';
+  if (ua.includes('Win')) os = 'Windows OS';
+  else if (ua.includes('Mac')) os = 'macOS';
+  else if (ua.includes('iPhone') || ua.includes('iPad')) os = 'iOS (Apple)';
+  else if (ua.includes('Android')) os = 'Android OS';
+  else if (ua.includes('Linux')) os = 'Linux OS';
+
+  const isMobile = ua.includes('Mobile') || ua.includes('Android') || ua.includes('iPhone');
+  const deviceType = isMobile ? 'Mobile' : 'Desktop';
+
+  return { browser, os, deviceType };
+}
+
 // ─── POST /api/ucp/login (SA-MP Player Login) ─────────────
 app.post('/api/ucp/login', async (req, res) => {
   try {
@@ -4557,10 +4582,33 @@ app.post('/api/ucp/login', async (req, res) => {
           return res.status(401).json({ message: "Invalid character password. Please try again." });
         }
 
+        const userAgentStr = req.headers['user-agent'] || '';
+        const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '127.0.0.1';
+        const parsedUa = parseUserAgent(userAgentStr);
+        const sessionId = 'sess_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
+
+        const newSession = {
+          sessionId,
+          browser: parsedUa.browser,
+          os: parsedUa.os,
+          deviceType: parsedUa.deviceType,
+          ip: clientIp.includes('::1') || clientIp.includes('127.0.0.1') ? '127.0.0.1 (Localhost)' : clientIp,
+          loginTime: new Date().toISOString(),
+          lastActive: new Date().toISOString()
+        };
+
+        if (!ucpActiveSessions.has(player.ID)) {
+          ucpActiveSessions.set(player.ID, []);
+        }
+        const pSessions = ucpActiveSessions.get(player.ID);
+        pSessions.unshift(newSession);
+        if (pSessions.length > 10) pSessions.pop();
+
         const ucpPayload = {
           ucpPlayerId: player.ID,
           id: player.ID,
           username: player.Username,
+          sessionId,
           isSampUser: true
         };
 
@@ -4629,6 +4677,17 @@ app.get('/api/ucp/stats', verifyUcpToken, (req, res) => {
       }
 
       const player = results[0];
+      console.log("🔍 RAW PLAYER DATE & TIME FIELDS FOR", player.Username, ":", {
+        RegDate: player.RegDate,
+        RegisterDate: player.RegisterDate,
+        RegTime: player.RegTime,
+        Registered: player.Registered,
+        LastLogin: player.LastLogin,
+        LastConnect: player.LastConnect,
+        ConnectTime: player.ConnectTime,
+        Reg_Date: player.Reg_Date,
+        CreateDate: player.CreateDate
+      });
       // Sanitize sensitive fields before returning to client
       delete player.Password;
       delete player.Salt;
@@ -4738,6 +4797,30 @@ app.get('/api/ucp/stats', verifyUcpToken, (req, res) => {
                         console.log(`📋 MEMBERS:`, player.factionMembers.map(m => `${m.Username} (Rank ${m.Rank}, Leader ${m.Leader}, Online ${m.Online})`));
                         console.log(`=======================================================\n`);
                       }
+                      const currentSessionId = req.ucpUser ? req.ucpUser.sessionId : null;
+                      const rawSessions = ucpActiveSessions.get(player.ID) || [];
+                      let pSessions = rawSessions.map(s => ({
+                        ...s,
+                        isCurrent: s.sessionId === currentSessionId
+                      }));
+
+                      if (pSessions.length === 0) {
+                        const userAgentStr = req.headers['user-agent'] || '';
+                        const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '127.0.0.1';
+                        const parsedUa = parseUserAgent(userAgentStr);
+                        pSessions.push({
+                          sessionId: currentSessionId || 'sess_current',
+                          browser: parsedUa.browser,
+                          os: parsedUa.os,
+                          deviceType: parsedUa.deviceType,
+                          ip: clientIp.includes('::1') || clientIp.includes('127.0.0.1') ? '127.0.0.1 (Localhost)' : clientIp,
+                          loginTime: new Date().toISOString(),
+                          lastActive: new Date().toISOString(),
+                          isCurrent: true
+                        });
+                      }
+
+                      player.activeSessions = pSessions;
                       res.json({ stats: player });
                     });
                   });
@@ -4749,6 +4832,38 @@ app.get('/api/ucp/stats', verifyUcpToken, (req, res) => {
       );
     }
   );
+});
+
+// ─── POST /api/ucp/sessions/revoke-others (Revoke all other active devices) ────
+app.post('/api/ucp/sessions/revoke-others', verifyUcpToken, (req, res) => {
+  const playerId = req.ucpUser.ucpPlayerId || req.ucpUser.id;
+  const currentSessionId = req.ucpUser.sessionId;
+
+  if (ucpActiveSessions.has(playerId)) {
+    const pSessions = ucpActiveSessions.get(playerId);
+    const updated = pSessions.filter(s => s.sessionId === currentSessionId);
+    ucpActiveSessions.set(playerId, updated);
+  }
+
+  res.json({ message: "Successfully logged out all other active device sessions." });
+});
+
+// ─── POST /api/ucp/sessions/revoke-one (Revoke a single specific device session) ────
+app.post('/api/ucp/sessions/revoke-one', verifyUcpToken, (req, res) => {
+  const playerId = req.ucpUser.ucpPlayerId || req.ucpUser.id;
+  const { sessionId } = req.body;
+
+  if (!sessionId) {
+    return res.status(400).json({ message: "Session ID is required." });
+  }
+
+  if (ucpActiveSessions.has(playerId)) {
+    const pSessions = ucpActiveSessions.get(playerId);
+    const updated = pSessions.filter(s => s.sessionId !== sessionId);
+    ucpActiveSessions.set(playerId, updated);
+  }
+
+  res.json({ message: "Device session removed successfully." });
 });
 
 // ─── GET /api/ucp/groups (Get All Factions & Gang Ranks Directory) ────
