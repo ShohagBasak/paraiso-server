@@ -1265,7 +1265,7 @@ app.put('/users/:id/role', verifyMaster, (req, res) => {
       db.query("DELETE FROM admin_permissions WHERE user_id = ?", [req.params.id]);
     } else if (role === 'admin') {
       // Auto-assign all permissions by default for sub-admins
-      const allPerms = ['banners', 'announcements', 'staff', 'roster', 'helper-roster', 'faqs'];
+      const allPerms = ['settings', 'banners', 'announcements', 'staff', 'roster', 'helper-roster', 'faqs', 'coc', 'donate', 'tickets'];
       db.query("DELETE FROM admin_permissions WHERE user_id = ?", [req.params.id], (errClear) => {
         if (!errClear) {
           const values = allPerms.map(p => [req.params.id, p]);
@@ -2198,10 +2198,7 @@ app.get('/server-info', (req, res) => {
   });
 });
 
-app.put('/server-info', verifyToken, (req, res) => {
-  if (req.user.role !== 'admin' && req.user.role !== 'master') {
-    return res.status(403).json({ message: 'Access denied' });
-  }
+app.put('/server-info', verifyPermission('settings'), (req, res) => {
 
   const { server_ip, discord_url, status } = req.body;
   const infoJson = JSON.stringify({
@@ -4662,7 +4659,40 @@ app.get('/api/ucp/me', verifyUcpToken, (req, res) => {
   );
 });
 
-// ─── GET /api/ucp/stats (Full SA-MP Character Details) ────
+// ─── UCP DATA SANITIZER (Strict Canonical UI Properties Only) ───
+function sanitizePlayerForUcp(player) {
+  if (!player || typeof player !== 'object') return {};
+
+  return {
+    ID: player.ID,
+    Username: player.Username,
+    Level: Number(player.Level || 1),
+    Skin: Number(player.Skin || 0),
+    Donator: Number(player.Donator || player.pDonator || player.VIP || player.VIPLevel || player.pVIP || 0),
+    DonatorTime: player.DonatorTime ?? player.DonatorDate ?? player.DonatorExp ?? player.DonatorExpire ?? player.DonatorExpiration ?? player.VIPTime ?? player.VIPDate ?? player.VIPExp ?? player.VIPExpire ?? player.DTime ?? player.DDate ?? player.DonationDate ?? player.DonationTime ?? player.DonationExp ?? player.pDonatorTime ?? player.pVIPTime ?? player.DonateTime ?? player.DonateDate ?? player.DonateExp ?? player.pVipTime ?? player.pVipExp ?? player.pVIPExp ?? player.VIP_Date ?? player.VIP_Time ?? player.VIP_Expire ?? player.Donator_Time ?? player.Donator_Date ?? player.VIP_Days ?? player.DonatorDays ?? player.pDonatorDays ?? player.pVIPDays ?? player.VIPDays ?? null,
+    Respect: Number(player.Respect || 0),
+    HoursPlayed: Number(player.HoursPlayed || 0),
+    ConnectTime: Number(player.ConnectTime || 0),
+    Age: Number(player.Age || 0),
+    Sex: Number(player.Sex ?? player.Gender ?? 0),
+    Health: Number(player.Health ?? player.pHealth ?? 100),
+    Armor: Number(player.Armor ?? player.Armour ?? player.SpawnArmor ?? player.pArmor ?? player.pArmour ?? 0),
+    PhoneNumber: player.PhoneNumber ? Number(player.PhoneNumber) : 0,
+    Member: Number(player.Member || 0),
+    Leader: Number(player.Leader || 0),
+    Faction: Number(player.Faction || 0),
+    Gang: Number(player.Gang || 0),
+    GangLeader: Number(player.GangLeader || 0),
+    Rank: Number(player.Rank || 0),
+    Job: Number(player.Job || 0),
+    Job2: Number(player.Job2 || 0),
+    MarriedTo: player.MarriedTo || player.Married || 'Nobody',
+    LastLogin: player.LastLogin || player.LastConnect || null,
+    Online: Number(player.Online || 0)
+  };
+}
+
+// ─── GET /api/ucp/stats (Fast Main Character Stats) ────────
 app.get('/api/ucp/stats', verifyUcpToken, (req, res) => {
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
   const playerId = req.ucpUser.ucpPlayerId || req.ucpUser.id;
@@ -4677,161 +4707,382 @@ app.get('/api/ucp/stats', verifyUcpToken, (req, res) => {
       }
 
       const player = results[0];
-      console.log("🔍 RAW PLAYER DATE & TIME FIELDS FOR", player.Username, ":", {
-        RegDate: player.RegDate,
-        RegisterDate: player.RegisterDate,
-        RegTime: player.RegTime,
-        Registered: player.Registered,
-        LastLogin: player.LastLogin,
-        LastConnect: player.LastConnect,
-        ConnectTime: player.ConnectTime,
-        Reg_Date: player.Reg_Date,
-        CreateDate: player.CreateDate
-      });
-      // Sanitize sensitive fields before returning to client
       delete player.Password;
       delete player.Salt;
       delete player.LastIP;
 
-      // Fetch vehicles, houses, and businesses owned by player
+      const sanitizedStats = sanitizePlayerForUcp(player);
+      res.json({ stats: sanitizedStats });
+    }
+  );
+});
+
+// ─── GET /api/ucp/vehicles (On-Demand Owned Vehicles) ──────
+app.get('/api/ucp/vehicles', verifyUcpToken, (req, res) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  const playerId = req.ucpUser.ucpPlayerId || req.ucpUser.id;
+  const username = req.ucpUser.username;
+
+  sampDb.query(
+    "SELECT ID, Online FROM players WHERE ID = ? OR Username = ? LIMIT 1",
+    [playerId, username],
+    (err, results) => {
+      if (err || !results || results.length === 0) {
+        return res.status(404).json({ message: "Player not found." });
+      }
+      const player = results[0];
+      const isPlayerOffline = !player.Online || Number(player.Online) === 0;
+
       sampDb.query(
         "SELECT * FROM playervehicles WHERE Owner = ?",
         [player.ID],
         (errV, vehicles) => {
-          if (errV) console.error("Error fetching vehicles:", errV);
-          
-          const isPlayerOffline = !player.Online || Number(player.Online) === 0;
+          if (errV) {
+            console.error("Error fetching vehicles:", errV);
+            return res.status(500).json({ message: "Database query error." });
+          }
 
-          // Auto-fix DB: If player is offline, reset any stale Spawned = 1 records to 0 in MySQL DB
           if (isPlayerOffline && player.ID) {
             sampDb.query(
               "UPDATE playervehicles SET Spawned = 0 WHERE Owner = ? AND Spawned = 1",
               [player.ID],
-              (errFix) => {
-                if (errFix) console.error("Error auto-fixing offline vehicles:", errFix);
-              }
+              () => {}
             );
           }
 
-          if (!errV && vehicles) {
-            player.vehicles = vehicles.map(v => ({
-              ...v,
-              Spawned: isPlayerOffline ? 0 : Number(v.Spawned || 0)
-            }));
-          } else {
-            player.vehicles = [];
-          }
+          const sanitizedVehicles = (vehicles || []).map((v, i) => {
+            const modelId = Number(v.ModelID ?? v.Model ?? v.model ?? v.pvModel ?? v.pvModelID ?? v.pvModelId ?? v.ModelId ?? v.Vehicle ?? v.vModel ?? v.cModel ?? v.v_model ?? v.c_model ?? 400);
+            const idVal = v.ID ?? v.id ?? v.pvID ?? v.pvId ?? v.vID ?? v.vId ?? v.cID ?? (i + 1);
+            return {
+              id: idVal,
+              ModelID: modelId,
+              Price: Number(v.Price || v.price || 0),
+              Locked: Number(v.Locked || v.Lock || 0),
+              Impound: Number(v.Impound || v.impound || 0),
+              Spawned: isPlayerOffline ? 0 : Number(v.Spawned || 0),
+              Location: v.Location || v.location || '',
+              PosX: Number(v.PosX ?? v.pos_x ?? v.X ?? 0),
+              PosY: Number(v.PosY ?? v.pos_y ?? v.Y ?? 0),
+              PosZ: Number(v.PosZ ?? v.pos_z ?? v.Z ?? 0)
+            };
+          });
 
-          sampDb.query(
-            "SELECT * FROM houses WHERE owner_id = ? OR owner = ?",
-            [player.ID, player.Username],
-            (errH, houses) => {
-              if (errH) console.error("Error fetching houses:", errH);
-              player.houses = (!errH && houses) ? houses : [];
-
-              sampDb.query(
-                "SELECT * FROM businesses WHERE owner_id = ? OR owner = ?",
-                [player.ID, player.Username],
-                (errB, businesses) => {
-                  if (errB) console.error("Error fetching businesses:", errB);
-                  player.businesses = (!errB && businesses) ? businesses : [];
-
-                  const officialFactionIds = [1, 2, 3, 4, 5, 9];
-                  const familyGangIds = [6, 7, 8, 10, 11, 12, 13];
-
-                  const rawId = Number(player.Member || player.Leader || player.Faction || 0);
-                  const rawGangCol = Number(player.Gang || 0);
-
-                  let factionId = 0;
-                  let gangId = 0;
-
-                  if (officialFactionIds.includes(rawId)) {
-                    factionId = rawId;
-                  } else if (familyGangIds.includes(rawId)) {
-                    gangId = rawId;
-                  }
-
-                  if (!gangId && rawGangCol > 0 && rawGangCol !== 255) {
-                    gangId = rawGangCol;
-                  }
-
-                  const fetchFaction = (next) => {
-                    if (factionId > 0) {
-                      sampDb.query(
-                        "SELECT ID, Username, `Rank`, Member, Leader, Faction, Gang, Online, Level, ConnectTime, Skin FROM players WHERE Member = ? OR Leader = ? OR Faction = ? ORDER BY Leader DESC, `Rank` DESC, Username ASC",
-                        [factionId, factionId, factionId],
-                        (errFM, fMembers) => {
-                          if (errFM) console.error("Error fetching faction members:", errFM);
-                          player.factionMembers = (!errFM && fMembers) ? fMembers : [];
-                          next();
-                        }
-                      );
-                    } else {
-                      player.factionMembers = [];
-                      next();
-                    }
-                  };
-
-                  const fetchGang = (next) => {
-                    if (gangId > 0 && gangId !== 255) {
-                      sampDb.query(
-                        "SELECT ID, Username, `Rank`, Member, Leader, Faction, Gang, Online, Level, ConnectTime, Skin FROM players WHERE Member = ? OR Leader = ? OR Faction = ? OR Gang = ? ORDER BY Leader DESC, `Rank` DESC, Username ASC",
-                        [gangId, gangId, gangId, gangId],
-                        (errGM, gMembers) => {
-                          if (errGM) console.error("Error fetching gang members:", errGM);
-                          player.gangMembers = (!errGM && gMembers) ? gMembers : [];
-                          next();
-                        }
-                      );
-                    } else {
-                      player.gangMembers = [];
-                      next();
-                    }
-                  };
-
-                  fetchFaction(() => {
-                    fetchGang(() => {
-                      if (factionId > 0) {
-                        console.log(`\n=======================================================`);
-                        console.log(`👮 FACTION #${factionId} MEMBERS FETCHED FROM DB: ${player.factionMembers.length} MEMBERS`);
-                        console.log(`📋 MEMBERS:`, player.factionMembers.map(m => `${m.Username} (Rank ${m.Rank}, Leader ${m.Leader}, Online ${m.Online})`));
-                        console.log(`=======================================================\n`);
-                      }
-                      const currentSessionId = req.ucpUser ? req.ucpUser.sessionId : null;
-                      const rawSessions = ucpActiveSessions.get(player.ID) || [];
-                      let pSessions = rawSessions.map(s => ({
-                        ...s,
-                        isCurrent: s.sessionId === currentSessionId
-                      }));
-
-                      if (pSessions.length === 0) {
-                        const userAgentStr = req.headers['user-agent'] || '';
-                        const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '127.0.0.1';
-                        const parsedUa = parseUserAgent(userAgentStr);
-                        pSessions.push({
-                          sessionId: currentSessionId || 'sess_current',
-                          browser: parsedUa.browser,
-                          os: parsedUa.os,
-                          deviceType: parsedUa.deviceType,
-                          ip: clientIp.includes('::1') || clientIp.includes('127.0.0.1') ? '127.0.0.1 (Localhost)' : clientIp,
-                          loginTime: new Date().toISOString(),
-                          lastActive: new Date().toISOString(),
-                          isCurrent: true
-                        });
-                      }
-
-                      player.activeSessions = pSessions;
-                      res.json({ stats: player });
-                    });
-                  });
-                }
-              );
-            }
-          );
+          res.json({ vehicles: sanitizedVehicles });
         }
       );
     }
   );
+});
+
+// ─── GET /api/ucp/properties (On-Demand Houses & Businesses) ────
+app.get('/api/ucp/properties', verifyUcpToken, (req, res) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  const playerId = req.ucpUser.ucpPlayerId || req.ucpUser.id;
+  const username = req.ucpUser.username;
+
+  sampDb.query(
+    "SELECT ID, Username FROM players WHERE ID = ? OR Username = ? LIMIT 1",
+    [playerId, username],
+    (err, results) => {
+      if (err || !results || results.length === 0) {
+        return res.status(404).json({ message: "Player not found." });
+      }
+      const player = results[0];
+      const pIdStr = String(player.ID);
+      const pNameLower = String(player.Username).toLowerCase();
+
+      sampDb.query("SELECT * FROM houses", (errH, allHouses) => {
+        const playerHouses = (allHouses || []).filter(h => {
+          const isOwner = String(h.owner_id || h.OwnerID || h.Owner_ID || h.owner || h.Owner || h.hOwner || '') === pIdStr ||
+                          String(h.owner || h.Owner || h.hOwner || '').toLowerCase() === pNameLower;
+          if (isOwner) return true;
+          const keyCols = ['key1', 'key2', 'key3', 'key4', 'key5', 'Key1', 'Key2', 'Key3', 'Key4', 'Key5', 'hKey1', 'hKey2', 'hKey3'];
+          for (const k of keyCols) {
+            const val = String(h[k] || '').toLowerCase();
+            if (val === pNameLower || val === pIdStr) return true;
+          }
+          if (h.keys || h.housekeys || h.shared_keys) {
+            const keysArr = String(h.keys || h.housekeys || h.shared_keys || '').toLowerCase().split(',').map(s => s.trim());
+            if (keysArr.includes(pNameLower) || keysArr.includes(pIdStr)) return true;
+          }
+          return false;
+        });
+
+        sampDb.query("SELECT * FROM businesses", (errB, allBusinesses) => {
+          const playerBusinesses = (allBusinesses || []).filter(b => {
+            return String(b.owner_id || b.OwnerID || b.Owner_ID || b.owner || b.Owner || b.bOwner || '') === pIdStr ||
+                   String(b.owner || b.Owner || b.bOwner || '').toLowerCase() === pNameLower;
+          });
+
+          const sanitizedHouses = playerHouses.map((h, i) => ({
+            id: h.id ?? h.ID ?? h.houseid ?? i,
+            owner: h.owner || h.Owner || h.hOwner || 'State',
+            owner_id: h.owner_id || h.OwnerID || h.Owner_ID || 0,
+            price: Number(h.price || h.hPrice || 0),
+            rent_fee: Number(h.rent_fee || h.rent || h.hRent || 0),
+            rentable: Number(h.rentable || h.hRentable || 0),
+            locked: Number(h.locked || h.Lock || h.hLocked || 0),
+            safe_money: Number(h.safe_money || h.money || h.safe || 0),
+            materials: Number(h.materials || 0),
+            level: Number(h.level || h.hLevel || 1),
+            gun1: h.gun1 || h.Gun1 || h.weapon1 || h.Weapon1 || 0,
+            gun2: h.gun2 || h.Gun2 || h.weapon2 || h.Weapon2 || 0,
+            gun3: h.gun3 || h.Gun3 || h.weapon3 || h.Weapon3 || 0,
+            ammo1: h.ammo1 || h.Ammo1 || 0,
+            ammo2: h.ammo2 || h.Ammo2 || 0,
+            ammo3: h.ammo3 || h.Ammo3 || 0
+          }));
+
+          const sanitizedBusinesses = playerBusinesses.map((b, i) => ({
+            id: (b.id !== undefined && b.id !== null) ? b.id : ((b.ID !== undefined && b.ID !== null) ? b.ID : (b.bizzid || b.BizzID || b.bID || i)),
+            name: b.bName || b.bizz_name || b.bizzName || b.StoreName || b.store_name || b.bTitle || b.Title || b.name || b.Name || b.interior_text || `Business #${i}`,
+            owner: b.owner || b.Owner || b.bOwner || 'State',
+            owner_id: b.owner_id || b.OwnerID || 0,
+            price: Number(b.price || b.Price || 0),
+            safe: Number(b.safe || b.Safe || b.money || b.Till || 0),
+            products: Number(b.products || b.Products || 0),
+            locked: Number(b.locked || b.Lock || b.bLocked || 0),
+            level: Number(b.level || b.Level || 1),
+            message: b.message || b.Message || b.bMessage || b.interior_text || ''
+          }));
+
+          res.json({ houses: sanitizedHouses, businesses: sanitizedBusinesses });
+        });
+      });
+    }
+  );
+});
+
+// ─── GET /api/ucp/faction-roster (On-Demand Faction Members) ───
+app.get('/api/ucp/faction-roster', verifyUcpToken, (req, res) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  const playerId = req.ucpUser.ucpPlayerId || req.ucpUser.id;
+  const username = req.ucpUser.username;
+
+  sampDb.query(
+    "SELECT Member, Leader, Faction FROM players WHERE ID = ? OR Username = ? LIMIT 1",
+    [playerId, username],
+    (err, results) => {
+      if (err || !results || results.length === 0) {
+        return res.status(404).json({ message: "Player not found." });
+      }
+
+      const player = results[0];
+      const officialFactionIds = [1, 2, 3, 4, 5, 9];
+      const rawId = Number(player.Member || player.Leader || player.Faction || 0);
+
+      if (!officialFactionIds.includes(rawId)) {
+        return res.json({ factionMembers: [] });
+      }
+
+      sampDb.query(
+        "SELECT ID, Username, `Rank`, Member, Leader, Faction, Gang, Online, Level, ConnectTime, Skin FROM players WHERE Member = ? OR Leader = ? OR Faction = ? ORDER BY Leader DESC, `Rank` DESC, Username ASC",
+        [rawId, rawId, rawId],
+        (errFM, fMembers) => {
+          if (errFM) console.error("Error fetching faction members:", errFM);
+          res.json({ factionMembers: (!errFM && fMembers) ? fMembers : [] });
+        }
+      );
+    }
+  );
+});
+
+// ─── GET /api/ucp/gang-roster (On-Demand Family/Gang Members) ───
+app.get('/api/ucp/gang-roster', verifyUcpToken, (req, res) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  const playerId = req.ucpUser.ucpPlayerId || req.ucpUser.id;
+  const username = req.ucpUser.username;
+
+  sampDb.query(
+    "SELECT Member, Leader, Faction, Gang FROM players WHERE ID = ? OR Username = ? LIMIT 1",
+    [playerId, username],
+    (err, results) => {
+      if (err || !results || results.length === 0) {
+        return res.status(404).json({ message: "Player not found." });
+      }
+
+      const player = results[0];
+      const familyGangIds = [6, 7, 8, 10, 11, 12, 13];
+      const rawId = Number(player.Member || player.Leader || player.Faction || 0);
+      const rawGangCol = Number(player.Gang || 0);
+
+      let gangId = 0;
+      if (familyGangIds.includes(rawId)) {
+        gangId = rawId;
+      }
+      if (!gangId && rawGangCol > 0 && rawGangCol !== 255) {
+        gangId = rawGangCol;
+      }
+
+      if (gangId === 0 || gangId === 255) {
+        return res.json({ gangMembers: [] });
+      }
+
+      sampDb.query(
+        "SELECT ID, Username, `Rank`, Member, Leader, Faction, Gang, Online, Level, ConnectTime, Skin FROM players WHERE Member = ? OR Leader = ? OR Faction = ? OR Gang = ? ORDER BY Leader DESC, `Rank` DESC, Username ASC",
+        [gangId, gangId, gangId, gangId],
+        (errGM, gMembers) => {
+          if (errGM) console.error("Error fetching gang members:", errGM);
+          res.json({ gangMembers: (!errGM && gMembers) ? gMembers : [] });
+        }
+      );
+    }
+  );
+});
+
+// ─── GET /api/ucp/inventory (On-Demand Carried Weapons & Inventory Items) ───
+app.get('/api/ucp/inventory', verifyUcpToken, (req, res) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  const playerId = req.ucpUser.ucpPlayerId || req.ucpUser.id;
+  const username = req.ucpUser.username;
+
+  sampDb.query(
+    "SELECT * FROM players WHERE ID = ? OR Username = ? LIMIT 1",
+    [playerId, username],
+    (err, results) => {
+      if (err || !results || results.length === 0) {
+        return res.status(404).json({ message: "Player not found." });
+      }
+
+      const player = results[0];
+
+      // Parse carried weapons
+      const weapons = [];
+      for (let s = 0; s <= 12; s++) {
+        const gunId = Number(player[`Gun${s}`] ?? player[`gun${s}`] ?? player[`Weapon${s}`] ?? 0);
+        const ammo = Number(player[`Ammo${s}`] ?? player[`ammo${s}`] ?? 0);
+        if (gunId > 0) {
+          weapons.push({ slot: s, id: gunId, ammo: ammo });
+        }
+      }
+
+      res.json({
+        weapons,
+        inventory: {
+          Rope: Number(player.Rope ?? player.rope ?? 0),
+          Cigars: Number(player.Cigars ?? player.Cigar ?? player.cigars ?? 0),
+          Sprunk: Number(player.Sprunk ?? player.sprunk ?? 0),
+          Spraycan: Number(player.Spraycan ?? player.Spray ?? player.spraycan ?? 0),
+          Seeds: Number(player.Seeds ?? player.Seed ?? player.seeds ?? 0),
+          Screwdriver: Number(player.Screwdriver ?? player.screwdriver ?? 0),
+          Wristwatch: Number(player.Wristwatch ?? player.Watch ?? player.wristwatch ?? 0),
+          Tires: Number(player.Tires ?? player.Tire ?? player.tire ?? 0),
+          FirstAid: Number(player.FirstAid ?? player.Firstaid ?? player.firstaid ?? 0),
+          RCCam: Number(player.RCCam ?? player.Rccam ?? player.rccam ?? 0),
+          Receiver: Number(player.Receiver ?? player.receiver ?? 0),
+          GPS: Number(player.GPS ?? player.Gps ?? player.gps ?? 0),
+          BugSweep: Number(player.BugSweep ?? player.Bugsweep ?? player.bugsweep ?? 0),
+          Lockpick: Number(player.Lockpick ?? player.Lockpicks ?? player.lockpick ?? 0),
+          RimKit: Number(player.RimKit ?? player.Rimkit ?? player.rimkit ?? 0),
+          Materials: Number(player.Materials || 0),
+          Crack: Number(player.Crack || 0),
+          Pot: Number(player.Pot || 0),
+          WeaponCrates: Number(player.WeaponCrates || 0),
+          DoubleExpToken: Number(player.DoubleExpToken || 0),
+          Boombox: Number(player.Boombox || 0),
+          Mp3: Number(player.Mp3 || 0),
+          Phonebook: Number(player.Phonebook || 0)
+        }
+      });
+    }
+  );
+});
+
+
+app.get('/api/ucp/skills', verifyUcpToken, (req, res) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  const playerId = req.ucpUser.ucpPlayerId || req.ucpUser.id;
+  const username = req.ucpUser.username;
+
+  sampDb.query(
+    "SELECT * FROM players WHERE ID = ? OR Username = ? LIMIT 1",
+    [playerId, username],
+    (err, results) => {
+      if (err || !results || results.length === 0) {
+        return res.status(404).json({ message: "Player not found." });
+      }
+
+      const player = results[0];
+
+      res.json({
+        skills: {
+          CarSkill: Number(player.CarSkill || 0),
+          TruckSkill: Number(player.TruckSkill || 0),
+          MaterialsSkill: Number(player.MaterialsSkill || 0),
+          ArmsSkill: Number(player.ArmsSkill || 0),
+          MechSkill: Number(player.MechSkill || 0),
+          LawyerSkill: Number(player.LawyerSkill || 0),
+          DrugsSkill: Number(player.DrugsSkill || 0),
+          DetectiveSkill: Number(player.DetectiveSkill || 0),
+          BoxerSkill: Number(player.BoxerSkill || 0),
+          DetSkill: Number(player.DetSkill || player.DetectiveSkill || 0),
+          LawSkill: Number(player.LawSkill || player.LawyerSkill || 0),
+          SexSkill: Number(player.SexSkill || player.WhoreSkill || 0),
+          SmugglerSkill: Number(player.SmugglerSkill || 0)
+        }
+      });
+    }
+  );
+});
+
+
+app.get('/api/ucp/finances', verifyUcpToken, (req, res) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  const playerId = req.ucpUser.ucpPlayerId || req.ucpUser.id;
+  const username = req.ucpUser.username;
+
+  sampDb.query(
+    "SELECT * FROM players WHERE ID = ? OR Username = ? LIMIT 1",
+    [playerId, username],
+    (err, results) => {
+      if (err || !results || results.length === 0) {
+        return res.status(404).json({ message: "Player not found." });
+      }
+
+      const player = results[0];
+      const cash = Number(player.Cash ?? player.pMoney ?? player.Money ?? 0);
+      const bank = Number(player.Bank ?? player.pBank ?? 0);
+
+      res.json({
+        finances: {
+          Cash: cash,
+          Bank: bank,
+          TotalWealth: cash + bank
+        }
+      });
+    }
+  );
+});
+
+// ─── GET /api/ucp/sessions (On-Demand Active Device Sessions) ───
+app.get('/api/ucp/sessions', verifyUcpToken, (req, res) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  const playerId = req.ucpUser.ucpPlayerId || req.ucpUser.id;
+  const currentSessionId = req.ucpUser ? req.ucpUser.sessionId : null;
+  const rawSessions = ucpActiveSessions.get(playerId) || [];
+
+  let pSessions = rawSessions.map(s => ({
+    ...s,
+    isCurrent: s.sessionId === currentSessionId
+  }));
+
+  if (pSessions.length === 0) {
+    const userAgentStr = req.headers['user-agent'] || '';
+    const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '127.0.0.1';
+    const parsedUa = parseUserAgent(userAgentStr);
+    pSessions.push({
+      sessionId: currentSessionId || 'sess_current',
+      browser: parsedUa.browser,
+      os: parsedUa.os,
+      deviceType: parsedUa.deviceType,
+      ip: clientIp.includes('::1') || clientIp.includes('127.0.0.1') ? '127.0.0.1 (Localhost)' : clientIp,
+      loginTime: new Date().toISOString(),
+      lastActive: new Date().toISOString(),
+      isCurrent: true
+    });
+  }
+
+  res.json({ activeSessions: pSessions });
 });
 
 // ─── POST /api/ucp/sessions/revoke-others (Revoke all other active devices) ────
@@ -4866,6 +5117,386 @@ app.post('/api/ucp/sessions/revoke-one', verifyUcpToken, (req, res) => {
   res.json({ message: "Device session removed successfully." });
 });
 
+// ─── HOUSE & BUSINESS LOOKUP HELPERS ─────────────────────────
+const findHouseInDb = (houseId, username, playerId, callback) => {
+  sampDb.query("SELECT * FROM houses", (err, houses) => {
+    if (err || !houses || houses.length === 0) return callback(err, null);
+    const house = houses.find((h, idx) => {
+      return String(h.id) === String(houseId) ||
+             String(h.ID) === String(houseId) ||
+             String(h.houseid) === String(houseId) ||
+             String(h.HouseID) === String(houseId) ||
+             String(h.hID) === String(houseId) ||
+             String(idx) === String(houseId);
+    }) || houses.find(h => 
+      String(h.owner_id || h.OwnerID || h.owner || h.Owner || '').toLowerCase() === String(playerId).toLowerCase() ||
+      String(h.owner || h.Owner || '').toLowerCase() === String(username).toLowerCase()
+    ) || houses[0];
+    callback(null, house);
+  });
+};
+
+const findBusinessInDb = (businessId, username, playerId, callback) => {
+  sampDb.query("SELECT * FROM businesses", (err, businesses) => {
+    if (err || !businesses || businesses.length === 0) return callback(err, null);
+    console.log("🏢 LOOKUP BUSINESSES COUNT:", businesses.length);
+    if (businesses[0]) {
+      console.log("🏢 BUSINESS DB KEYS:", Object.keys(businesses[0]));
+    }
+    const bizz = businesses.find((b, idx) => {
+      return String(b.id) === String(businessId) ||
+             String(b.ID) === String(businessId) ||
+             String(b.bizzid) === String(businessId) ||
+             String(b.BizzID) === String(businessId) ||
+             String(b.bID) === String(businessId) ||
+             String(b.bizz_id) === String(businessId) ||
+             String(idx) === String(businessId);
+    }) || businesses.find(b => 
+      String(b.owner_id || b.OwnerID || b.owner || b.Owner || b.bOwner || '').toLowerCase() === String(playerId).toLowerCase() ||
+      String(b.owner || b.Owner || b.bOwner || '').toLowerCase() === String(username).toLowerCase()
+    ) || businesses[0];
+
+    callback(null, bizz);
+  });
+};
+
+// ─── HOUSE MANAGEMENT ENDPOINTS ─────────────────────────────
+
+// 1. Give House Key (/givehousekeys)
+app.post('/api/ucp/houses/give-key', verifyUcpToken, (req, res) => {
+  const playerId = req.ucpUser.ucpPlayerId || req.ucpUser.id;
+  const username = req.ucpUser.username;
+  const { houseId, targetUsername } = req.body;
+
+  if (!houseId || !targetUsername || !targetUsername.trim()) {
+    return res.status(400).json({ message: "House ID and Target Character Name are required." });
+  }
+
+  const cleanTarget = targetUsername.trim();
+
+  sampDb.query("SELECT ID, Username FROM players WHERE LOWER(Username) = LOWER(?) LIMIT 1", [cleanTarget], (errP, pResults) => {
+    if (errP || !pResults || pResults.length === 0) {
+      return res.status(404).json({ message: `Target character "${cleanTarget}" not found in database.` });
+    }
+
+    const targetPlayer = pResults[0];
+
+    findHouseInDb(houseId, username, playerId, (errH, house) => {
+      if (errH || !house) {
+        return res.status(404).json({ message: "House not found." });
+      }
+
+      const isOwner = String(house.owner_id || house.OwnerID || house.owner || house.Owner || '').toLowerCase() === String(playerId).toLowerCase() ||
+                      String(house.owner || house.Owner || '').toLowerCase() === String(username).toLowerCase();
+
+      if (!isOwner) {
+        return res.status(403).json({ message: "You are not the owner of this house." });
+      }
+
+      const keysColNames = ['key1', 'key2', 'key3', 'key4', 'key5', 'Key1', 'Key2', 'Key3', 'Key4', 'Key5', 'hKey1', 'hKey2', 'hKey3'];
+      let targetCol = null;
+
+      for (const col of keysColNames) {
+        if (col in house) {
+          const val = house[col];
+          if (String(val).toLowerCase() === String(targetPlayer.Username).toLowerCase() || String(val) === String(targetPlayer.ID)) {
+            return res.status(400).json({ message: `Character "${targetPlayer.Username}" already has a key to this house.` });
+          }
+          if (!targetCol && (!val || val === '0' || val === 0 || val === 'None' || val === '' || val === null)) {
+            targetCol = col;
+          }
+        }
+      }
+
+      const houseIdCol = Object.keys(house).find(k => k.toLowerCase() === 'id' || k.toLowerCase() === 'houseid') || 'id';
+
+      if (targetCol) {
+        sampDb.query(`UPDATE houses SET \`${targetCol}\` = ? WHERE \`${houseIdCol}\` = ?`, [targetPlayer.Username, house[houseIdCol]], (errU) => {
+          if (errU) {
+            console.error("Error giving house key:", errU);
+            return res.status(500).json({ message: "Failed to update house key in database." });
+          }
+          res.json({ message: `Successfully gave house key to ${targetPlayer.Username}!` });
+        });
+      } else if ('keys' in house || 'housekeys' in house || 'shared_keys' in house) {
+        const listCol = 'keys' in house ? 'keys' : ('housekeys' in house ? 'housekeys' : 'shared_keys');
+        let currentKeys = house[listCol] ? String(house[listCol]).split(',').map(s => s.trim()).filter(Boolean) : [];
+        if (!currentKeys.includes(targetPlayer.Username)) {
+          currentKeys.push(targetPlayer.Username);
+        }
+        sampDb.query(`UPDATE houses SET \`${listCol}\` = ? WHERE \`${houseIdCol}\` = ?`, [currentKeys.join(','), house[houseIdCol]], (errU) => {
+          if (errU) return res.status(500).json({ message: "Failed to update house keys." });
+          res.json({ message: `Successfully gave house key to ${targetPlayer.Username}!` });
+        });
+      } else {
+        sampDb.query(`UPDATE houses SET key1 = ? WHERE \`${houseIdCol}\` = ?`, [targetPlayer.Username, house[houseIdCol]], (errU) => {
+          if (errU) {
+            sampDb.query(`UPDATE houses SET key1 = key1 WHERE \`${houseIdCol}\` = ?`, [house[houseIdCol]], () => {});
+          }
+          res.json({ message: `House key given to ${targetPlayer.Username} successfully!` });
+        });
+      }
+    });
+  });
+});
+
+// 2. Take House Key (/takehousekeys)
+app.post('/api/ucp/houses/take-key', verifyUcpToken, (req, res) => {
+  const playerId = req.ucpUser.ucpPlayerId || req.ucpUser.id;
+  const username = req.ucpUser.username;
+  const { houseId, targetUsername } = req.body;
+
+  if (!houseId || !targetUsername) {
+    return res.status(400).json({ message: "House ID and Target Character Name are required." });
+  }
+
+  const cleanTarget = targetUsername.trim().toLowerCase();
+
+  findHouseInDb(houseId, username, playerId, (errH, house) => {
+    if (errH || !house) {
+      return res.status(404).json({ message: "House not found." });
+    }
+
+    const isOwner = String(house.owner_id || house.OwnerID || house.owner || house.Owner || '').toLowerCase() === String(playerId).toLowerCase() ||
+                    String(house.owner || house.Owner || '').toLowerCase() === String(username).toLowerCase();
+
+    if (!isOwner) {
+      return res.status(403).json({ message: "You are not the owner of this house." });
+    }
+
+    const houseIdCol = Object.keys(house).find(k => k.toLowerCase() === 'id' || k.toLowerCase() === 'houseid') || 'id';
+    const keysColNames = ['key1', 'key2', 'key3', 'key4', 'key5', 'Key1', 'Key2', 'Key3', 'Key4', 'Key5', 'hKey1', 'hKey2', 'hKey3'];
+
+    keysColNames.forEach(col => {
+      if (col in house) {
+        const val = String(house[col] || '').toLowerCase();
+        if (val === cleanTarget) {
+          sampDb.query(`UPDATE houses SET \`${col}\` = '0' WHERE \`${houseIdCol}\` = ?`, [house[houseIdCol]], () => {});
+        }
+      }
+    });
+
+    if ('keys' in house || 'housekeys' in house || 'shared_keys' in house) {
+      const listCol = 'keys' in house ? 'keys' : ('housekeys' in house ? 'housekeys' : 'shared_keys');
+      let currentKeys = house[listCol] ? String(house[listCol]).split(',').map(s => s.trim()).filter(s => s.toLowerCase() !== cleanTarget) : [];
+      sampDb.query(`UPDATE houses SET \`${listCol}\` = ? WHERE \`${houseIdCol}\` = ?`, [currentKeys.join(','), house[houseIdCol]], () => {});
+    }
+
+    res.json({ message: `Successfully revoked house key from ${targetUsername}!` });
+  });
+});
+
+// 3. Toggle House Lock Status
+app.post('/api/ucp/houses/toggle-lock', verifyUcpToken, (req, res) => {
+  const playerId = req.ucpUser.ucpPlayerId || req.ucpUser.id;
+  const username = req.ucpUser.username;
+  const { houseId } = req.body;
+
+  findHouseInDb(houseId, username, playerId, (errH, house) => {
+    if (errH || !house) return res.status(404).json({ message: "House not found." });
+
+    const houseIdCol = Object.keys(house).find(k => k.toLowerCase() === 'id' || k.toLowerCase() === 'houseid') || 'id';
+    const lockCol = Object.keys(house).find(k => k.toLowerCase() === 'locked' || k.toLowerCase() === 'lock' || k.toLowerCase() === 'hlocked') || 'locked';
+    
+    const currentLock = Number(house[lockCol] || 0);
+    const newLock = currentLock === 1 ? 0 : 1;
+
+    sampDb.query(`UPDATE houses SET \`${lockCol}\` = ? WHERE \`${houseIdCol}\` = ?`, [newLock, house[houseIdCol]], (errU) => {
+      if (errU) return res.status(500).json({ message: "Failed to update house lock state." });
+      res.json({ message: `House is now ${newLock === 1 ? 'Locked 🔒' : 'Unlocked 🔓'}!` });
+    });
+  });
+});
+
+
+// ─── BUSINESS MANAGEMENT ENDPOINTS ─────────────────────────
+
+// 1. Transfer Ownership / Sell Business to Player
+app.post('/api/ucp/businesses/change-owner', verifyUcpToken, (req, res) => {
+  const playerId = req.ucpUser.ucpPlayerId || req.ucpUser.id;
+  const username = req.ucpUser.username;
+  const { businessId, newOwnerUsername } = req.body;
+
+  if (!businessId || !newOwnerUsername || !newOwnerUsername.trim()) {
+    return res.status(400).json({ message: "Business ID and New Owner Character Name are required." });
+  }
+
+  const cleanTarget = newOwnerUsername.trim();
+
+  sampDb.query("SELECT ID, Username FROM players WHERE LOWER(Username) = LOWER(?) LIMIT 1", [cleanTarget], (errP, pResults) => {
+    if (errP || !pResults || pResults.length === 0) {
+      return res.status(404).json({ message: `Character "${cleanTarget}" not found in database.` });
+    }
+
+    const newOwner = pResults[0];
+
+    findBusinessInDb(businessId, username, playerId, (errB, bizz) => {
+      if (errB || !bizz) {
+        return res.status(404).json({ message: "Business not found." });
+      }
+
+      const isOwner = String(bizz.owner_id || bizz.OwnerID || bizz.owner || bizz.Owner || bizz.bOwner || '').toLowerCase() === String(playerId).toLowerCase() ||
+                      String(bizz.owner || bizz.Owner || bizz.bOwner || '').toLowerCase() === String(username).toLowerCase();
+
+      if (!isOwner) {
+        return res.status(403).json({ message: "You are not the owner of this business." });
+      }
+
+      const bizzIdCol = Object.keys(bizz).find(k => k.toLowerCase() === 'id' || k.toLowerCase() === 'bizzid' || k.toLowerCase() === 'bid' || k.toLowerCase() === 'bizz_id') || 'id';
+      const ownerCol = Object.keys(bizz).find(k => k.toLowerCase() === 'owner' || k.toLowerCase() === 'bowner') || 'owner';
+      const ownerIdCol = Object.keys(bizz).find(k => k.toLowerCase() === 'owner_id' || k.toLowerCase() === 'ownerid');
+
+      let updateSql = `UPDATE businesses SET \`${ownerCol}\` = ?`;
+      let params = [newOwner.Username];
+
+      if (ownerIdCol && ownerIdCol in bizz) {
+        updateSql += `, \`${ownerIdCol}\` = ?`;
+        params.push(newOwner.ID);
+      }
+
+      updateSql += ` WHERE \`${bizzIdCol}\` = ?`;
+      params.push(bizz[bizzIdCol]);
+
+      sampDb.query(updateSql, params, (errU) => {
+        if (errU) {
+          console.error("Error transferring business ownership:", errU);
+          return res.status(500).json({ message: "Failed to transfer business ownership." });
+        }
+        res.json({ message: `Business ownership transferred to ${newOwner.Username} successfully!` });
+      });
+    });
+  });
+});
+
+// 2. Update Business Details (Store Name & Message)
+app.post('/api/ucp/businesses/update-details', verifyUcpToken, (req, res) => {
+  const playerId = req.ucpUser.ucpPlayerId || req.ucpUser.id;
+  const username = req.ucpUser.username;
+  const { businessId, storeName, storeMessage } = req.body;
+
+  findBusinessInDb(businessId, username, playerId, (errB, bizz) => {
+    if (errB || !bizz) return res.status(404).json({ message: "Business not found." });
+
+    const isOwner = String(bizz.owner_id || bizz.OwnerID || bizz.owner || bizz.Owner || bizz.bOwner || '').toLowerCase() === String(playerId).toLowerCase() ||
+                    String(bizz.owner || bizz.Owner || bizz.bOwner || '').toLowerCase() === String(username).toLowerCase();
+
+    if (!isOwner) return res.status(403).json({ message: "You are not the owner of this business." });
+
+    const bizzIdCol = Object.keys(bizz).find(k => k.toLowerCase() === 'id' || k.toLowerCase() === 'bizzid' || k.toLowerCase() === 'bid' || k.toLowerCase() === 'bizz_id') || 'id';
+    const nameCol = Object.keys(bizz).find(k => k.toLowerCase() === 'name' || k.toLowerCase() === 'storename' || k.toLowerCase() === 'bname') || 'name';
+    const msgCol = Object.keys(bizz).find(k => k.toLowerCase() === 'message' || k.toLowerCase() === 'bmessage') || 'message';
+
+    let updates = [];
+    let params = [];
+
+    if (storeName !== undefined && nameCol in bizz) {
+      updates.push(`\`${nameCol}\` = ?`);
+      params.push(storeName.trim());
+    }
+
+    if (storeMessage !== undefined && msgCol in bizz) {
+      updates.push(`\`${msgCol}\` = ?`);
+      params.push(storeMessage.trim());
+    }
+
+    if (updates.length === 0) return res.status(400).json({ message: "No valid fields provided to update." });
+
+    params.push(bizz[bizzIdCol]);
+
+    sampDb.query(`UPDATE businesses SET ${updates.join(', ')} WHERE \`${bizzIdCol}\` = ?`, params, (errU) => {
+      if (errU) return res.status(500).json({ message: "Failed to update business details." });
+      res.json({ message: "Business store details updated successfully!" });
+    });
+  });
+});
+
+// 3. Toggle Business Lock Status
+app.post('/api/ucp/businesses/toggle-lock', verifyUcpToken, (req, res) => {
+  const playerId = req.ucpUser.ucpPlayerId || req.ucpUser.id;
+  const username = req.ucpUser.username;
+  const { businessId } = req.body;
+
+  findBusinessInDb(businessId, username, playerId, (errB, bizz) => {
+    if (errB || !bizz) return res.status(404).json({ message: "Business not found." });
+
+    const isOwner = String(bizz.owner_id || bizz.OwnerID || bizz.owner || bizz.Owner || bizz.bOwner || '').toLowerCase() === String(playerId).toLowerCase() ||
+                    String(bizz.owner || bizz.Owner || bizz.bOwner || '').toLowerCase() === String(username).toLowerCase();
+
+    if (!isOwner) return res.status(403).json({ message: "You are not the owner of this business." });
+
+    const bizzIdCol = Object.keys(bizz).find(k => k.toLowerCase() === 'id' || k.toLowerCase() === 'bizzid' || k.toLowerCase() === 'bid' || k.toLowerCase() === 'bizz_id') || 'id';
+    const lockCol = Object.keys(bizz).find(k => k.toLowerCase() === 'locked' || k.toLowerCase() === 'lock' || k.toLowerCase() === 'blocked') || 'locked';
+    
+    const currentLock = Number(bizz[lockCol] || 0);
+    const newLock = currentLock === 1 ? 0 : 1;
+
+    sampDb.query(`UPDATE businesses SET \`${lockCol}\` = ? WHERE \`${bizzIdCol}\` = ?`, [newLock, bizz[bizzIdCol]], (errU) => {
+      if (errU) return res.status(500).json({ message: "Failed to update business lock state." });
+      res.json({ message: `Business is now ${newLock === 1 ? 'Locked 🔒' : 'Unlocked 🔓'}!` });
+    });
+  });
+});
+
+// 4. Deposit / Withdraw Money from Business Safe
+app.post('/api/ucp/businesses/safe-transaction', verifyUcpToken, (req, res) => {
+  const playerId = req.ucpUser.ucpPlayerId || req.ucpUser.id;
+  const username = req.ucpUser.username;
+  const { businessId, action, amount } = req.body;
+
+  const numAmount = parseInt(amount, 10);
+  if (!businessId || !action || isNaN(numAmount) || numAmount <= 0) {
+    return res.status(400).json({ message: "Business ID, Action (deposit/withdraw), and valid positive Amount are required." });
+  }
+
+  findBusinessInDb(businessId, username, playerId, (errB, bizz) => {
+    if (errB || !bizz) return res.status(404).json({ message: "Business not found." });
+
+    const isOwner = String(bizz.owner_id || bizz.OwnerID || bizz.owner || bizz.Owner || bizz.bOwner || '').toLowerCase() === String(playerId).toLowerCase() ||
+                    String(bizz.owner || bizz.Owner || bizz.bOwner || '').toLowerCase() === String(username).toLowerCase();
+
+    if (!isOwner) return res.status(403).json({ message: "You are not the owner of this business." });
+
+    sampDb.query("SELECT * FROM players WHERE ID = ? OR Username = ? LIMIT 1", [playerId, username], (errP, pResults) => {
+      if (errP || !pResults || pResults.length === 0) return res.status(404).json({ message: "Player account not found." });
+
+      const player = pResults[0];
+      const bizzIdCol = Object.keys(bizz).find(k => k.toLowerCase() === 'id' || k.toLowerCase() === 'bizzid' || k.toLowerCase() === 'bid' || k.toLowerCase() === 'bizz_id') || 'id';
+      const safeCol = Object.keys(bizz).find(k => k.toLowerCase() === 'safe' || k.toLowerCase() === 'till' || k.toLowerCase() === 'vault' || k.toLowerCase() === 'bsafe' || k.toLowerCase() === 'money') || 'safe';
+      const cashCol = 'Money' in player ? 'Money' : ('Cash' in player ? 'Cash' : ('money' in player ? 'money' : 'Money'));
+
+      const currentSafe = Number(bizz[safeCol] || 0);
+      const currentCash = Number(player[cashCol] || 0);
+
+      if (action === 'withdraw') {
+        if (currentSafe < numAmount) {
+          return res.status(400).json({ message: `Insufficient business safe balance! Available in safe: $${currentSafe.toLocaleString()}` });
+        }
+        const newSafe = currentSafe - numAmount;
+        const newCash = currentCash + numAmount;
+
+        sampDb.query(`UPDATE businesses SET \`${safeCol}\` = ? WHERE \`${bizzIdCol}\` = ?`, [newSafe, bizz[bizzIdCol]], (errU1) => {
+          if (errU1) return res.status(500).json({ message: "Failed to update business safe." });
+          sampDb.query(`UPDATE players SET \`${cashCol}\` = ? WHERE ID = ?`, [newCash, player.ID], () => {});
+          res.json({ message: `Successfully withdrew $${numAmount.toLocaleString()} from business safe to your character's cash!` });
+        });
+
+      } else if (action === 'deposit') {
+        if (currentCash < numAmount) {
+          return res.status(400).json({ message: `Insufficient character cash! You have: $${currentCash.toLocaleString()}` });
+        }
+        const newSafe = currentSafe + numAmount;
+        const newCash = currentCash - numAmount;
+
+        sampDb.query(`UPDATE businesses SET \`${safeCol}\` = ? WHERE \`${bizzIdCol}\` = ?`, [newSafe, bizz[bizzIdCol]], (errU1) => {
+          if (errU1) return res.status(500).json({ message: "Failed to update business safe." });
+          sampDb.query(`UPDATE players SET \`${cashCol}\` = ? WHERE ID = ?`, [newCash, player.ID], () => {});
+          res.json({ message: `Successfully deposited $${numAmount.toLocaleString()} into business safe!` });
+        });
+      }
+    });
+  });
+});
+
 // ─── GET /api/ucp/groups (Get All Factions & Gang Ranks Directory) ────
 app.get('/api/ucp/groups', (req, res) => {
   sampDb.query(
@@ -4897,12 +5528,9 @@ app.get('/api/ucp/player/:username', (req, res) => {
       }
 
       const player = results[0];
-      // Sanitize sensitive fields before returning
-      delete player.Password;
-      delete player.Salt;
-      delete player.LastIP;
+      const sanitizedPlayer = sanitizePlayerForUcp(player);
 
-      res.json({ player });
+      res.json({ player: sanitizedPlayer });
     }
   );
 });
@@ -4984,3 +5612,27 @@ io.on('connection', (socket) => {
 });
 
 server.listen(5000, () => console.log("Server is running on port 5000"));
+
+app.get('/api/ucp/debug-tables', (req, res) => {
+  sampDb.query("SHOW TABLES", (err, tables) => {
+    const tableList = tables ? tables.map(t => Object.values(t)[0]) : [];
+    sampDb.query("DESCRIBE houses", (errH, houseCols) => {
+      sampDb.query("DESCRIBE businesses", (errB, bizzCols) => {
+        sampDb.query("SHOW TABLES LIKE '%key%'", (errK, keyTables) => {
+          sampDb.query("SELECT * FROM houses LIMIT 1", (errH1, hSample) => {
+            sampDb.query("SELECT * FROM businesses LIMIT 1", (errB1, bSample) => {
+              res.json({
+                tables: tableList,
+                keyTables,
+                houseColumns: houseCols ? houseCols.map(c => c.Field) : errH ? errH.message : null,
+                businessColumns: bizzCols ? bizzCols.map(c => c.Field) : errB ? errB.message : null,
+                houseSample: hSample && hSample[0] ? hSample[0] : null,
+                businessSample: bSample && bSample[0] ? bSample[0] : null
+              });
+            });
+          });
+        });
+      });
+    });
+  });
+});
