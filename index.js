@@ -4474,6 +4474,9 @@ async function verifySampPassword(inputPassword, storedHash, salt = '', username
 
 const UCP_JWT_SECRET = process.env.JWT_SECRET || 'paraiso_ucp_secret_key_2026';
 
+// UCP Active Logged-in Devices Session Tracker
+const ucpActiveSessions = new Map();
+
 // ─── Middleware: verifyUcpToken ────────────────────────────
 function verifyUcpToken(req, res, next) {
   let token = req.cookies.ucp_token;
@@ -4501,15 +4504,22 @@ function verifyUcpToken(req, res, next) {
   }
 
   if (verifiedUser) {
+    const pId = verifiedUser.ucpPlayerId || verifiedUser.id;
+    const sessId = verifiedUser.sessionId;
+    if (pId && sessId && ucpActiveSessions.has(pId)) {
+      const activeList = ucpActiveSessions.get(pId) || [];
+      const isStillActive = activeList.some(s => s.sessionId === sessId);
+      if (!isStillActive) {
+        return res.status(401).json({ message: 'This device session has been logged out/revoked.' });
+      }
+    }
+
     req.ucpUser = verifiedUser;
     return next();
   }
 
   return res.status(403).json({ message: 'Invalid or expired UCP session' });
 }
-
-// UCP Active Logged-in Devices Session Tracker
-const ucpActiveSessions = new Map();
 
 function parseUserAgent(ua) {
   if (!ua) return { browser: 'Browser', os: 'Desktop OS', deviceType: 'Desktop' };
