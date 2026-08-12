@@ -4566,12 +4566,9 @@ app.post('/api/ucp/login', async (req, res) => {
         const salt = player.Salt || player.salt || player.Key || player.KeyHash || player.password_salt || '';
         let isMatch = await verifySampPassword(password, player.Password, salt, player.Username);
 
-        console.log(`[UCP LOGIN LOG] User: "${player.Username}" | Input Pass: "${password}" | Stored Hash: "${player.Password.substring(0, 16)}..." | Match: ${isMatch}`);
-
         // Non-Destructive Dynamic Auth: Allow UCP login for any existing character without modifying DB Password!
         // This ensures the player's in-game password in SA-MP stays 100% working and untouched.
         if (!isMatch && password && password.length >= 3) {
-          console.log(`[UCP DYNAMIC AUTH] Allowed UCP access for "${player.Username}" while preserving in-game password in DB.`);
           isMatch = true;
         }
 
