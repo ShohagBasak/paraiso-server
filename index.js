@@ -4814,7 +4814,6 @@ app.get('/api/ucp/properties', verifyUcpToken, (req, res) => {
           const sanitizedHouses = playerHouses.map((h, i) => ({
             id: h.id ?? h.ID ?? h.houseid ?? i,
             owner: h.owner || h.Owner || h.hOwner || 'State',
-            owner_id: h.owner_id || h.OwnerID || h.Owner_ID || 0,
             price: Number(h.price || h.hPrice || 0),
             rent_fee: Number(h.rent_fee || h.rent || h.hRent || 0),
             rentable: Number(h.rentable || h.hRentable || 0),
@@ -4824,17 +4823,13 @@ app.get('/api/ucp/properties', verifyUcpToken, (req, res) => {
             level: Number(h.level || h.hLevel || 1),
             gun1: h.gun1 || h.Gun1 || h.weapon1 || h.Weapon1 || 0,
             gun2: h.gun2 || h.Gun2 || h.weapon2 || h.Weapon2 || 0,
-            gun3: h.gun3 || h.Gun3 || h.weapon3 || h.Weapon3 || 0,
-            ammo1: h.ammo1 || h.Ammo1 || 0,
-            ammo2: h.ammo2 || h.Ammo2 || 0,
-            ammo3: h.ammo3 || h.Ammo3 || 0
+            gun3: h.gun3 || h.Gun3 || h.weapon3 || h.Weapon3 || 0
           }));
 
           const sanitizedBusinesses = playerBusinesses.map((b, i) => ({
             id: (b.id !== undefined && b.id !== null) ? b.id : ((b.ID !== undefined && b.ID !== null) ? b.ID : (b.bizzid || b.BizzID || b.bID || i)),
             name: b.bName || b.bizz_name || b.bizzName || b.StoreName || b.store_name || b.bTitle || b.Title || b.name || b.Name || b.interior_text || `Business #${i}`,
             owner: b.owner || b.Owner || b.bOwner || 'State',
-            owner_id: b.owner_id || b.OwnerID || 0,
             price: Number(b.price || b.Price || 0),
             safe: Number(b.safe || b.Safe || b.money || b.Till || 0),
             products: Number(b.products || b.Products || 0),
@@ -4873,11 +4868,19 @@ app.get('/api/ucp/faction-roster', verifyUcpToken, (req, res) => {
       }
 
       sampDb.query(
-        "SELECT ID, Username, `Rank`, Member, Leader, Faction, Gang, Online, Level, ConnectTime, Skin FROM players WHERE Member = ? OR Leader = ? OR Faction = ? ORDER BY Leader DESC, `Rank` DESC, Username ASC",
+        "SELECT ID, Username, `Rank`, Leader, Online, Level FROM players WHERE Member = ? OR Leader = ? OR Faction = ? ORDER BY Leader DESC, `Rank` DESC, Username ASC",
         [rawId, rawId, rawId],
         (errFM, fMembers) => {
           if (errFM) console.error("Error fetching faction members:", errFM);
-          res.json({ factionMembers: (!errFM && fMembers) ? fMembers : [] });
+          const sanitized = (!errFM && fMembers) ? fMembers.map(m => ({
+            ID: m.ID,
+            Username: m.Username,
+            Rank: Number(m.Rank || 0),
+            Leader: Number(m.Leader || 0),
+            Level: Number(m.Level || 1),
+            Online: Number(m.Online || 0)
+          })) : [];
+          res.json({ factionMembers: sanitized });
         }
       );
     }
@@ -4916,11 +4919,19 @@ app.get('/api/ucp/gang-roster', verifyUcpToken, (req, res) => {
       }
 
       sampDb.query(
-        "SELECT ID, Username, `Rank`, Member, Leader, Faction, Gang, Online, Level, ConnectTime, Skin FROM players WHERE Member = ? OR Leader = ? OR Faction = ? OR Gang = ? ORDER BY Leader DESC, `Rank` DESC, Username ASC",
+        "SELECT ID, Username, `Rank`, Leader, Online, Level FROM players WHERE Member = ? OR Leader = ? OR Faction = ? OR Gang = ? ORDER BY Leader DESC, `Rank` DESC, Username ASC",
         [gangId, gangId, gangId, gangId],
         (errGM, gMembers) => {
           if (errGM) console.error("Error fetching gang members:", errGM);
-          res.json({ gangMembers: (!errGM && gMembers) ? gMembers : [] });
+          const sanitized = (!errGM && gMembers) ? gMembers.map(m => ({
+            ID: m.ID,
+            Username: m.Username,
+            Rank: Number(m.Rank || 0),
+            Leader: Number(m.Leader || 0),
+            Level: Number(m.Level || 1),
+            Online: Number(m.Online || 0)
+          })) : [];
+          res.json({ gangMembers: sanitized });
         }
       );
     }
@@ -5029,7 +5040,7 @@ app.get('/api/ucp/finances', verifyUcpToken, (req, res) => {
   const username = req.ucpUser.username;
 
   sampDb.query(
-    "SELECT * FROM players WHERE ID = ? OR Username = ? LIMIT 1",
+    "SELECT Cash, Bank FROM players WHERE ID = ? OR Username = ? LIMIT 1",
     [playerId, username],
     (err, results) => {
       if (err || !results || results.length === 0) {
