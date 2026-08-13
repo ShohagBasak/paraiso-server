@@ -272,6 +272,35 @@ db.query(`
   if (err) console.error("Error creating donate_items table:", err);
 });
 
+// Auto-seed Paraiso Coins category and item into DB if missing
+setTimeout(() => {
+  db.query("SELECT id FROM donate_categories WHERE LOWER(name) LIKE '%coin%' OR LOWER(name) LIKE '%currency%'", (err, cats) => {
+    if (err) return console.error("Coins category check error:", err.message);
+    if (!cats || cats.length === 0) {
+      db.query("INSERT INTO donate_categories (name, sort_order) VALUES ('Coins', 0)", (err2, catRes) => {
+        if (err2) return console.error("Error inserting Coins category:", err2.message);
+        if (catRes && catRes.insertId) {
+          const catId = catRes.insertId;
+          db.query("INSERT INTO donate_items (category_id, name, description, image_url, price, sort_order) VALUES (?, 'Paraiso Coins', 'Official Paraiso Coins (PC). Choose packages from 1,000 PC to 24,000 PC.', '/Donator_-_Paraiso_Coins.jpg', 5.00, 0)", [catId], (err3) => {
+            if (err3) console.error("Error inserting Paraiso Coins item:", err3.message);
+            else console.log("✅ Auto-seeded Paraiso Coins item and Coins category into DB!");
+          });
+        }
+      });
+    } else {
+      const catId = cats[0].id;
+      db.query("SELECT id FROM donate_items WHERE LOWER(name) LIKE '%coin%'", (err3, coinItems) => {
+        if (!err3 && (!coinItems || coinItems.length === 0)) {
+          db.query("INSERT INTO donate_items (category_id, name, description, image_url, price, sort_order) VALUES (?, 'Paraiso Coins', 'Official Paraiso Coins (PC). Choose packages from 1,000 PC to 24,000 PC.', '/Donator_-_Paraiso_Coins.jpg', 5.00, 0)", [catId], (err4) => {
+            if (err4) console.error("Error inserting Paraiso Coins item:", err4.message);
+            else console.log("✅ Auto-seeded Paraiso Coins item into existing Coins category in DB!");
+          });
+        }
+      });
+    }
+  });
+}, 2000);
+
 // ─── Initialize Purchase Tickets Table ────────────────────
 db.query(`
   CREATE TABLE IF NOT EXISTS purchase_tickets (
@@ -1102,8 +1131,9 @@ app.post('/login', (req, res) => {
   if (!email || !password) {
     return res.status(400).json({ message: "Email and password are required." });
   }
-  const sql = "SELECT * FROM users WHERE email = ?";
-  db.query(sql, [email], async (err, results) => {
+  const cleanEmail = (email || '').trim().toLowerCase();
+  const sql = "SELECT * FROM users WHERE LOWER(TRIM(email)) = ?";
+  db.query(sql, [cleanEmail], async (err, results) => {
     try {
       if (err) {
         console.error("Login SELECT error:", err);
@@ -3468,7 +3498,7 @@ app.get('/donate-items/:id', (req, res) => {
   );
 });
 
-// Auto migrations for renewal_price & order_type
+// Auto migrations for renewal_price & order_type & coin_options
 db.query("SHOW COLUMNS FROM donate_items LIKE 'renewal_price'", (err, rows) => {
   if (!err && rows && rows.length === 0) {
     db.query("ALTER TABLE donate_items ADD COLUMN renewal_price DECIMAL(10,2) DEFAULT NULL", (err2) => {
@@ -3476,10 +3506,43 @@ db.query("SHOW COLUMNS FROM donate_items LIKE 'renewal_price'", (err, rows) => {
     });
   }
 });
+db.query("SHOW COLUMNS FROM donate_items LIKE 'coin_options'", (err, rows) => {
+  if (!err && rows && rows.length === 0) {
+    db.query("ALTER TABLE donate_items ADD COLUMN coin_options TEXT DEFAULT NULL", (err2) => {
+      if (!err2) console.log("Added coin_options column to donate_items table.");
+      else console.error("Migration error (coin_options):", err2);
+    });
+  }
+});
+db.query("SHOW COLUMNS FROM purchase_tickets LIKE 'notes'", (err, rows) => {
+  if (!err && rows && rows.length === 0) {
+    db.query("ALTER TABLE purchase_tickets ADD COLUMN notes TEXT DEFAULT NULL", (err2) => {
+      if (!err2) console.log("Added notes column to purchase_tickets table.");
+      else console.error("Migration error (notes):", err2);
+    });
+  }
+});
 db.query("SHOW COLUMNS FROM purchase_tickets LIKE 'order_type'", (err, rows) => {
   if (!err && rows && rows.length === 0) {
     db.query("ALTER TABLE purchase_tickets ADD COLUMN order_type VARCHAR(20) DEFAULT 'new'", (err2) => {
       if (!err2) console.log("Added order_type column to purchase_tickets table.");
+      else console.error("Migration error (order_type):", err2);
+    });
+  }
+});
+db.query("SHOW COLUMNS FROM ticket_items LIKE 'item_price'", (err, rows) => {
+  if (!err && rows && rows.length === 0) {
+    db.query("ALTER TABLE ticket_items ADD COLUMN item_price DECIMAL(10,2) DEFAULT 0.00", (err2) => {
+      if (!err2) console.log("Added item_price column to ticket_items table.");
+      else console.error("Migration error (item_price):", err2);
+    });
+  }
+});
+db.query("SHOW COLUMNS FROM ticket_items LIKE 'notes'", (err, rows) => {
+  if (!err && rows && rows.length === 0) {
+    db.query("ALTER TABLE ticket_items ADD COLUMN notes VARCHAR(255) DEFAULT NULL", (err2) => {
+      if (!err2) console.log("Added notes column to ticket_items table.");
+      else console.error("Migration error (notes ticket_items):", err2);
     });
   }
 });
@@ -3487,19 +3550,20 @@ db.query("SHOW COLUMNS FROM email_otps LIKE 'type'", (err, rows) => {
   if (!err && rows && rows.length === 0) {
     db.query("ALTER TABLE email_otps ADD COLUMN type VARCHAR(30) DEFAULT 'registration'", (err2) => {
       if (!err2) console.log("Added type column to email_otps table.");
+      else console.error("Migration error (type):", err2);
     });
   }
 });
 
 // POST /donate-items — admin: create item
 app.post('/donate-items', verifyPermission('donate'), (req, res) => {
-  const { category_id, name, description, image_url, price } = req.body;
+  const { category_id, name, description, image_url, price, coin_options } = req.body;
   if (!category_id || !name) return res.status(400).json({ message: 'Category and name are required' });
   db.query("SELECT MAX(sort_order) as maxOrder FROM donate_items", (err, orderResult) => {
     const nextOrder = (orderResult && orderResult[0]?.maxOrder !== null) ? orderResult[0].maxOrder + 1 : 0;
     db.query(
-      "INSERT INTO donate_items (category_id, name, description, image_url, price, sort_order) VALUES (?, ?, ?, ?, ?, ?)",
-      [category_id, name, description || '', image_url || '', price || 0, nextOrder],
+      "INSERT INTO donate_items (category_id, name, description, image_url, price, coin_options, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      [category_id, name, description || '', image_url || '', price || 0, coin_options !== undefined ? coin_options : null, nextOrder],
       (err2, result) => {
         if (err2) return res.status(500).json({ message: 'Failed to create item' });
         res.status(201).json({ message: 'Item created', id: result.insertId });
@@ -3510,7 +3574,7 @@ app.post('/donate-items', verifyPermission('donate'), (req, res) => {
 
 // PUT /donate-items/:id — admin: update item
 app.put('/donate-items/:id', verifyPermission('donate'), (req, res) => {
-  const { category_id, name, description, image_url, price, is_active } = req.body;
+  const { category_id, name, description, image_url, price, is_active, coin_options } = req.body;
   db.query(
     `UPDATE donate_items SET 
       category_id = COALESCE(?, category_id),
@@ -3518,9 +3582,10 @@ app.put('/donate-items/:id', verifyPermission('donate'), (req, res) => {
       description = COALESCE(?, description),
       image_url = COALESCE(?, image_url),
       price = COALESCE(?, price),
-      is_active = COALESCE(?, is_active)
+      is_active = COALESCE(?, is_active),
+      coin_options = COALESCE(?, coin_options)
     WHERE id = ?`,
-    [category_id, name, description, image_url, price, is_active, req.params.id],
+    [category_id, name, description, image_url, price, is_active, coin_options, req.params.id],
     (err) => {
       if (err) return res.status(500).json({ message: 'Failed to update item' });
       res.json({ message: 'Item updated' });
@@ -3566,21 +3631,34 @@ app.post('/tickets', verifyToken, (req, res) => {
   const qty = Math.max(1, parseInt(quantity) || 1);
 
   // Verify item exists
-  db.query("SELECT id, name, price FROM donate_items WHERE id = ? AND is_active = 1", [item_id], (err, items) => {
+  db.query("SELECT id, name, price, coin_options FROM donate_items WHERE id = ? AND is_active = 1", [item_id], (err, items) => {
     if (err || items.length === 0) return res.status(404).json({ message: 'Item not found or inactive' });
 
     const item = items[0];
-    const unitPrice = parseFloat(item.price);
-    const totalPrice = (unitPrice * qty).toFixed(2);
+    const isCoin = (item.coin_options || req.body.package_price) ? true : ((item.name || '').toLowerCase().includes('coin') || (item.name || '').toLowerCase().includes('pc'));
+    const unitPrice = (isCoin && req.body.package_price) ? parseFloat(req.body.package_price) : parseFloat(item.price);
+    const pkgCoins = req.body.package_coins ? parseInt(req.body.package_coins) : 1000;
+    
+    let rawQty = parseInt(quantity) || 1;
+    // Safety check: if quantity passed is equal to coin amount (e.g. 2100), force package count to 1
+    if (isCoin && (rawQty === pkgCoins || rawQty > 100)) {
+      rawQty = 1;
+    }
+    const pkgCount = Math.max(1, rawQty);
+    const totalPrice = (unitPrice * pkgCount).toFixed(2);
+    const pkgLabel = req.body.package_label || req.body.notes || '';
+    const totalCoins = (pkgCoins * pkgCount).toLocaleString();
 
     db.query(
-      "INSERT INTO purchase_tickets (user_id, item_id, ingame_name, discord_username, quantity) VALUES (?, ?, ?, ?, ?)",
-      [req.user.id, item_id, ingame_name.trim(), discord_username.trim(), qty],
+      "INSERT INTO purchase_tickets (user_id, item_id, ingame_name, discord_username, quantity, notes) VALUES (?, ?, ?, ?, ?, ?)",
+      [req.user.id, item_id, ingame_name.trim(), discord_username.trim(), pkgCount, pkgLabel],
       (err2, result) => {
         if (err2) return res.status(500).json({ message: 'Failed to create ticket' });
         const ticketId = result.insertId;
 
-        const autoMsg = `🛒 Purchase Request Details:\n• Ingame Name: ${ingame_name.trim()}\n• Discord Username: ${discord_username.trim()}\n• Item: ${item.name}\n• Unit Price: $${unitPrice.toFixed(2)}\n• Quantity: ${qty}\n• Total Price: $${totalPrice}`;
+        const autoMsg = isCoin
+          ? `🛒 Purchase Request Details:\n• Ingame Name: ${ingame_name.trim()}\n• Discord Username: ${discord_username.trim()}\n• Item: ${item.name}\n• Package: ${pkgLabel}\n• Quantity: ${pkgCount} ${pkgCount === 1 ? 'package' : 'packages'} (${totalCoins} PC Total)\n• Total Price: $${totalPrice}`
+          : `🛒 Purchase Request Details:\n• Ingame Name: ${ingame_name.trim()}\n• Discord Username: ${discord_username.trim()}\n• Item: ${item.name}\n• Unit Price: $${unitPrice.toFixed(2)}\n• Quantity: ${pkgCount}\n• Total Price: $${totalPrice}`;
 
         db.query(
           "INSERT INTO ticket_messages (ticket_id, sender_id, message) VALUES (?, ?, ?)",
@@ -3590,8 +3668,8 @@ app.post('/tickets', verifyToken, (req, res) => {
 
         // Also insert first item into ticket_items table
         db.query(
-          "INSERT INTO ticket_items (ticket_id, item_id, quantity) VALUES (?, ?, ?)",
-          [ticketId, item_id, qty],
+          "INSERT INTO ticket_items (ticket_id, item_id, quantity, item_price, notes) VALUES (?, ?, ?, ?, ?)",
+          [ticketId, item_id, pkgCount, unitPrice, pkgLabel],
           () => {} // fire and forget
         );
 
@@ -3663,8 +3741,10 @@ app.post('/tickets/:id/items', verifyToken, (req, res) => {
     if (err || tickets.length === 0) return res.status(404).json({ message: 'Ticket not found' });
     const ticket = tickets[0];
 
-    if (ticket.user_id !== req.user.id) {
-      return res.status(403).json({ message: 'You can only add items to your own tickets' });
+    const isAdmin = req.user.role === 'admin' || req.user.role === 'master';
+
+    if (ticket.user_id !== req.user.id && !isAdmin) {
+      return res.status(403).json({ message: 'You do not have permission to modify this ticket' });
     }
     if (ticket.status === 'closed') {
       return res.status(400).json({ message: 'Cannot add items to a closed ticket' });
@@ -3673,19 +3753,34 @@ app.post('/tickets/:id/items', verifyToken, (req, res) => {
     // Verify item exists and is active
     db.query("SELECT id, name, price FROM donate_items WHERE id = ? AND is_active = 1", [item_id], (err2, items) => {
       if (err2 || items.length === 0) return res.status(404).json({ message: 'Item not found or inactive' });
-      const item = items[0];
-      const unitPrice = parseFloat(item.price);
-      const totalPrice = (unitPrice * qty).toFixed(2);
+    const item = items[0];
+    const isCoin = (item.coin_options || req.body.package_price) ? true : ((item.name || '').toLowerCase().includes('coin') || (item.name || '').toLowerCase().includes('pc'));
+    const unitPrice = (isCoin && req.body.package_price) ? parseFloat(req.body.package_price) : parseFloat(item.price);
+      const pkgCount = Math.max(1, parseInt(quantity) || 1);
+      const totalPrice = (unitPrice * pkgCount).toFixed(2);
+      const pkgLabel = req.body.package_label || '';
 
-      // Insert into ticket_items
-      db.query(
-        "INSERT INTO ticket_items (ticket_id, item_id, quantity) VALUES (?, ?, ?)",
-        [req.params.id, item_id, qty],
-        (err3, result) => {
-          if (err3) return res.status(500).json({ message: 'Failed to add item' });
+      const doInsertItem = (hasItemPriceColumn = true) => {
+        const sql = hasItemPriceColumn
+          ? "INSERT INTO ticket_items (ticket_id, item_id, quantity, item_price, notes) VALUES (?, ?, ?, ?, ?)"
+          : "INSERT INTO ticket_items (ticket_id, item_id, quantity) VALUES (?, ?, ?)";
+        const params = hasItemPriceColumn
+          ? [req.params.id, item_id, pkgCount, unitPrice, pkgLabel]
+          : [req.params.id, item_id, pkgCount];
+
+        db.query(sql, params, (err3, result) => {
+          if (err3) {
+            if (hasItemPriceColumn) {
+              return doInsertItem(false);
+            }
+            console.error("Error inserting ticket item:", err3.message);
+            return res.status(500).json({ message: 'Failed to add item: ' + err3.message });
+          }
 
           // Auto-message in ticket chat
-          const autoMsg = `➕ New Item Added to Ticket:\n• Item: ${item.name}\n• Unit Price: $${unitPrice.toFixed(2)}\n• Quantity: ${qty}\n• Subtotal: $${totalPrice}`;
+          const autoMsg = isCoin
+            ? `➕ New Item Added to Ticket:\n• Item: ${item.name} ${pkgLabel ? `(${pkgLabel})` : ''}\n• Price: $${unitPrice.toFixed(2)}\n• Quantity: ${pkgCount} ${pkgCount === 1 ? 'package' : 'packages'}\n• Subtotal: $${totalPrice}`
+            : `➕ New Item Added to Ticket:\n• Item: ${item.name}\n• Unit Price: $${unitPrice.toFixed(2)}\n• Quantity: ${pkgCount}\n• Subtotal: $${totalPrice}`;
           db.query(
             "INSERT INTO ticket_messages (ticket_id, sender_id, message) VALUES (?, ?, ?)",
             [req.params.id, req.user.id, autoMsg],
@@ -3746,12 +3841,50 @@ app.post('/tickets/:id/items', verifyToken, (req, res) => {
             notifyAllAdmins(notifData);
           }
 
+          recalculateAndUpdateTicketTotal(req.params.id);
           res.status(201).json({ message: 'Item added to ticket', id: result.insertId, item_name: item.name });
         }
       );
+    };
+
+    doInsertItem(true);
     });
   });
 });
+
+function recalculateAndUpdateTicketTotal(ticketId) {
+  db.query(
+    `SELECT SUM(COALESCE(NULLIF(ti.item_price, 0), di.price) * ti.quantity) as grandTotal
+     FROM ticket_items ti
+     LEFT JOIN donate_items di ON di.id = ti.item_id
+     WHERE ti.ticket_id = ?`,
+    [ticketId],
+    (err, rows) => {
+      if (err || !rows || rows.length === 0) return;
+      const grandTotal = parseFloat(rows[0].grandTotal || 0).toFixed(2);
+
+      // Find initial purchase request message
+      db.query(
+        "SELECT id, message FROM ticket_messages WHERE ticket_id = ? AND message LIKE '🛒 Purchase Request Details:%' ORDER BY id ASC LIMIT 1",
+        [ticketId],
+        (mErr, mRows) => {
+          if (!mErr && mRows && mRows.length > 0) {
+            const initialMsg = mRows[0].message;
+            const updatedMsg = initialMsg.replace(/• Total Price: \$\d+(\.\d{2})?/, `• Total Price: $${grandTotal}`);
+            if (updatedMsg !== initialMsg) {
+              db.query("UPDATE ticket_messages SET message = ? WHERE id = ?", [updatedMsg, mRows[0].id], () => {
+                if (global.io) {
+                  global.io.to(`ticket-${ticketId}`).emit('ticket-message-updated', { id: mRows[0].id, message: updatedMsg, ticket_id: parseInt(ticketId) });
+                  global.io.to('admin-tickets').emit('ticket-message-updated', { id: mRows[0].id, message: updatedMsg, ticket_id: parseInt(ticketId) });
+                }
+              });
+            }
+          }
+        }
+      );
+    }
+  );
+}
 
 // PUT /tickets/:ticketId/items/:itemId — edit item quantity or item in ticket
 app.put('/tickets/:ticketId/items/:itemId', verifyToken, (req, res) => {
@@ -3788,8 +3921,14 @@ app.put('/tickets/:ticketId/items/:itemId', verifyToken, (req, res) => {
           (err4) => {
             if (err4) return res.status(500).json({ message: 'Failed to update ticket item' });
 
-            const autoMsg = `✏️ Ticket Item Updated:\n• Item: ${newItem.name}\n• Quantity: ${newQty}\n• Subtotal: $${(parseFloat(newItem.price) * newQty).toFixed(2)}`;
-            const msgPattern = `✏️ Ticket Item Updated:\n• Item: ${newItem.name}%`;
+            // Also update main purchase_tickets quantity
+            db.query("UPDATE purchase_tickets SET quantity = ? WHERE id = ?", [newQty, ticketId], () => {});
+
+            const itemPrice = (currentTi.item_price && parseFloat(currentTi.item_price) > 0) ? parseFloat(currentTi.item_price) : parseFloat(newItem.price);
+            const isCoin = (newItem.name || '').toLowerCase().includes('coin') || (newItem.name || '').toLowerCase().includes('pc');
+            const subtotal = (itemPrice * newQty).toFixed(2);
+            const autoMsg = `✏️ Ticket Item Quantity Updated:\n• Item: ${newItem.name}\n• Unit Price: $${itemPrice.toFixed(2)} ${isCoin ? 'per pkg' : 'each'}\n• Quantity: ${newQty} ${isCoin ? (newQty === 1 ? 'package' : 'packages') : ''}\n• Subtotal: $${subtotal}`;
+            const msgPattern = `✏️ Ticket Item Quantity Updated:\n• Item: ${newItem.name}%`;
 
             db.query(
               "SELECT id FROM ticket_messages WHERE ticket_id = ? AND message LIKE ? ORDER BY id DESC LIMIT 1",
@@ -3804,6 +3943,8 @@ app.put('/tickets/:ticketId/items/:itemId', verifyToken, (req, res) => {
                       if (global.io) {
                         global.io.to(`ticket-${ticketId}`).emit('ticket-item-updated', { ticketId: parseInt(ticketId), itemId: ticketItemId });
                         global.io.to('admin-tickets').emit('ticket-item-updated', { ticketId: parseInt(ticketId), itemId: ticketItemId });
+                        global.io.to(`ticket-${ticketId}`).emit('ticket-updated', { id: parseInt(ticketId) });
+                        global.io.to('admin-tickets').emit('ticket-updated', { id: parseInt(ticketId) });
                       }
                     }
                   );
@@ -3827,12 +3968,15 @@ app.put('/tickets/:ticketId/items/:itemId', verifyToken, (req, res) => {
                     if (global.io) {
                       global.io.to(`ticket-${ticketId}`).emit('ticket-item-updated', { ticketId: parseInt(ticketId), itemId: ticketItemId });
                       global.io.to('admin-tickets').emit('ticket-item-updated', { ticketId: parseInt(ticketId), itemId: ticketItemId });
+                      global.io.to(`ticket-${ticketId}`).emit('ticket-updated', { id: parseInt(ticketId) });
+                      global.io.to('admin-tickets').emit('ticket-updated', { id: parseInt(ticketId) });
                     }
                   });
                 }
               }
             );
 
+            recalculateAndUpdateTicketTotal(ticketId);
             res.json({ message: 'Ticket item updated successfully' });
           }
         );
@@ -3876,6 +4020,7 @@ app.delete('/tickets/:ticketId/items/:itemId', verifyToken, (req, res) => {
           global.io.to('admin-tickets').emit('ticket-item-deleted', { ticketId: parseInt(ticketId), itemId: ticketItemId });
         }
 
+        recalculateAndUpdateTicketTotal(ticketId);
         res.json({ message: 'Item removed from ticket' });
       });
     });
@@ -3901,7 +4046,7 @@ app.get('/tickets/:id/items', verifyToken, (req, res) => {
 
   function fetchTicketItems() {
     db.query(
-      `SELECT ti.*, di.name as item_name, di.price as item_price, di.image_url as item_image, di.description as item_description
+      `SELECT ti.*, di.name as item_name, COALESCE(NULLIF(ti.item_price, 0), di.price) as item_price, di.image_url as item_image, di.description as item_description
        FROM ticket_items ti
        LEFT JOIN donate_items di ON di.id = ti.item_id
        WHERE ti.ticket_id = ?
@@ -3914,7 +4059,7 @@ app.get('/tickets/:id/items', verifyToken, (req, res) => {
             if (!err3 && pRes && pRes.length > 0 && pRes[0].item_id) {
               db.query("INSERT INTO ticket_items (ticket_id, item_id, quantity) VALUES (?, ?, ?)", [req.params.id, pRes[0].item_id, pRes[0].quantity || 1], () => {
                 db.query(
-                  `SELECT ti.*, di.name as item_name, di.price as item_price, di.image_url as item_image, di.description as item_description
+                  `SELECT ti.*, di.name as item_name, COALESCE(NULLIF(ti.item_price, 0), di.price) as item_price, di.image_url as item_image, di.description as item_description
                    FROM ticket_items ti
                    LEFT JOIN donate_items di ON di.id = ti.item_id
                    WHERE ti.ticket_id = ?
@@ -4741,28 +4886,29 @@ app.post('/api/ucp/login', async (req, res) => {
   }
 });
 
-// ─── GET /api/ucp/me (Check active UCP Session) ───────────
+// ─── GET /api/ucp/me (Check active UCP Session & Stats) ────
 app.get('/api/ucp/me', verifyUcpToken, (req, res) => {
   const playerId = req.ucpUser.ucpPlayerId || req.ucpUser.id;
   const username = req.ucpUser.username;
 
   sampDb.query(
-    "SELECT ID, Username, Level, Skin, AdminLevel, Donator FROM players WHERE ID = ? OR Username = ? LIMIT 1",
+    "SELECT * FROM players WHERE ID = ? OR Username = ? LIMIT 1",
     [playerId, username],
     (err, results) => {
       if (err || !results || results.length === 0) {
         return res.status(404).json({ message: "Character account not found." });
       }
       const player = results[0];
+      const stats = sanitizePlayerForUcp(player);
       res.json({
         user: {
           id: player.ID,
           username: player.Username,
           level: player.Level || 1,
           skin: player.Skin || 0,
-          adminLevel: player.AdminLevel || 0,
           donator: player.Donator || 0
-        }
+        },
+        stats
       });
     }
   );
@@ -4772,33 +4918,54 @@ app.get('/api/ucp/me', verifyUcpToken, (req, res) => {
 function sanitizePlayerForUcp(player) {
   if (!player || typeof player !== 'object') return {};
 
+  const id = player.ID || player.id;
+  const username = player.Username || player.username;
+  const level = Number(player.Level || 1);
+  const skin = Number(player.Skin || 0);
+  const donator = Number(player.Donator || player.pDonator || player.VIP || player.VIPLevel || player.pVIP || 0);
+  const donatorTime = player.DonatorTime ?? player.DonatorDate ?? player.DonatorExp ?? player.DonatorExpire ?? player.DonatorExpiration ?? player.VIPTime ?? player.VIPDate ?? player.VIPExp ?? player.VIPExpire ?? player.DTime ?? player.DDate ?? player.DonationDate ?? player.DonationTime ?? player.DonationExp ?? player.pDonatorTime ?? player.pVIPTime ?? player.DonateTime ?? player.DonateDate ?? player.DonateExp ?? player.pVipTime ?? player.pVipExp ?? player.pVIPExp ?? player.VIP_Date ?? player.VIP_Time ?? player.VIP_Expire ?? player.Donator_Time ?? player.Donator_Date ?? player.VIP_Days ?? player.DonatorDays ?? player.pDonatorDays ?? player.pVIPDays ?? player.VIPDays ?? null;
+  const respect = Number(player.Respect || 0);
+  const hoursPlayed = Number(player.HoursPlayed || player.ConnectTime || 0);
+  const age = Number(player.Age || 0);
+  const sex = Number(player.Sex ?? player.Gender ?? 0);
+  const health = Number(player.Health ?? player.pHealth ?? 100);
+  const armor = Number(player.Armor ?? player.Armour ?? player.SpawnArmor ?? player.pArmor ?? player.pArmour ?? 0);
+  const phoneNumber = player.PhoneNumber ? Number(player.PhoneNumber) : 0;
+  const member = Number(player.Member || 0);
+  const leader = Number(player.Leader || 0);
+  const faction = Number(player.Faction || 0);
+  const gang = Number(player.Gang || 0);
+  const gangLeader = Number(player.GangLeader || 0);
+  const rank = Number(player.Rank || 0);
+  const job = Number(player.Job || 0);
+  const job2 = Number(player.Job2 || 0);
+  const marriedTo = player.MarriedTo || player.Married || 'Nobody';
+  const lastLogin = player.LastLogin || player.LastConnect || null;
+  const online = Number(player.Online || 0);
   return {
-    ID: player.ID,
-    Username: player.Username,
-    Level: Number(player.Level || 1),
-    Skin: Number(player.Skin || 0),
-    Donator: Number(player.Donator || player.pDonator || player.VIP || player.VIPLevel || player.pVIP || 0),
-    DonatorTime: player.DonatorTime ?? player.DonatorDate ?? player.DonatorExp ?? player.DonatorExpire ?? player.DonatorExpiration ?? player.VIPTime ?? player.VIPDate ?? player.VIPExp ?? player.VIPExpire ?? player.DTime ?? player.DDate ?? player.DonationDate ?? player.DonationTime ?? player.DonationExp ?? player.pDonatorTime ?? player.pVIPTime ?? player.DonateTime ?? player.DonateDate ?? player.DonateExp ?? player.pVipTime ?? player.pVipExp ?? player.pVIPExp ?? player.VIP_Date ?? player.VIP_Time ?? player.VIP_Expire ?? player.Donator_Time ?? player.Donator_Date ?? player.VIP_Days ?? player.DonatorDays ?? player.pDonatorDays ?? player.pVIPDays ?? player.VIPDays ?? null,
-    Respect: Number(player.Respect || 0),
-    HoursPlayed: Number(player.HoursPlayed || 0),
-    ConnectTime: Number(player.ConnectTime || 0),
-    Age: Number(player.Age || 0),
-    Sex: Number(player.Sex ?? player.Gender ?? 0),
-    Health: Number(player.Health ?? player.pHealth ?? 100),
-    Armor: Number(player.Armor ?? player.Armour ?? player.SpawnArmor ?? player.pArmor ?? player.pArmour ?? 0),
-    PhoneNumber: player.PhoneNumber ? Number(player.PhoneNumber) : 0,
-    Member: Number(player.Member || 0),
-    Leader: Number(player.Leader || 0),
-    Faction: Number(player.Faction || 0),
-    Gang: Number(player.Gang || 0),
-    GangLeader: Number(player.GangLeader || 0),
-    Rank: Number(player.Rank || 0),
-    Job: Number(player.Job || 0),
-    Job2: Number(player.Job2 || 0),
-    MarriedTo: player.MarriedTo || player.Married || 'Nobody',
-    LastLogin: player.LastLogin || player.LastConnect || null,
-    Online: Number(player.Online || 0),
-    AdminLevel: Number(player.AdminLevel || player.Admin || player.pAdmin || player.LevelAdmin || 0)
+    username,
+    level,
+    skin,
+    donator,
+    donatorTime,
+    respect,
+    hoursPlayed,
+    age,
+    sex,
+    health,
+    armor,
+    phoneNumber,
+    member,
+    leader,
+    faction,
+    gang,
+    gangLeader,
+    rank,
+    job,
+    job2,
+    marriedTo,
+    lastLogin,
+    online
   };
 }
 
@@ -4827,7 +4994,7 @@ app.get('/api/ucp/stats', verifyUcpToken, (req, res) => {
   );
 });
 
-// ─── GET /api/ucp/vehicles (On-Demand Owned Vehicles) ──────
+// ─── GET /api/ucp/vehicles (On-Demand Owned Vehicles) 
 app.get('/api/ucp/vehicles', verifyUcpToken, (req, res) => {
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
   const playerId = req.ucpUser.ucpPlayerId || req.ucpUser.id;
@@ -4884,7 +5051,7 @@ app.get('/api/ucp/vehicles', verifyUcpToken, (req, res) => {
   );
 });
 
-// ─── GET /api/ucp/properties (On-Demand Houses & Businesses) ────
+// ─── GET /api/ucp/properties ────
 app.get('/api/ucp/properties', verifyUcpToken, (req, res) => {
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
   const playerId = req.ucpUser.ucpPlayerId || req.ucpUser.id;
@@ -5983,7 +6150,7 @@ app.get('/api/highscores',highscoresLimiter, (req, res) => {
     fishing: ['FishSkill', 'FishingSkill', 'pFishSkill'],
     carjacker: ['CarSkill', 'CarjackerSkill', 'pCarSkill'],
     smuggler: ['SmugglerSkill', 'pSmugglerSkill'],
-    prostitute: ['SexSkill', 'WhoreSkill', 'pSexSkill']
+    prostitute: ['SexTime', 'pSexTime', 'WhoreTimes', 'pWhoreTimes', 'SexSkill', 'WhoreSkill', 'pSexSkill']
   };
 
   if (category === 'cars') {
@@ -6437,6 +6604,9 @@ app.get('/api/highscores',highscoresLimiter, (req, res) => {
       if (category === 'carjacker') {
         return Number(p.CarsStolen ?? p.pCarsStolen ?? p.CarsSold ?? p.pCarsSold ?? p.Carjacker ?? p.pCarjacker ?? p.CarSkill ?? p.pCarSkill ?? p.CarjackerSkill ?? 0);
       }
+      if (category === 'prostitute') {
+        return Number(p.SexTime ?? p.pSexTime ?? p.WhoreTimes ?? p.pWhoreTimes ?? p.SexTimes ?? p.pSexTimes ?? p.SexCount ?? p.pSexCount ?? p.Sexes ?? p.pSexes ?? p.SexSkill ?? p.pSexSkill ?? p.WhoreSkill ?? 0);
+      }
 
       // Check job skill columns
       if (jobSkillCols[category]) {
@@ -6467,7 +6637,7 @@ app.get('/api/highscores',highscoresLimiter, (req, res) => {
       fishing: '',
       carjacker: '',
       smuggler: '',
-      prostitute: ''
+      prostitute: 'Times'
     };
 
     const ranked = players.map(p => {
@@ -6487,8 +6657,9 @@ app.get('/api/highscores',highscoresLimiter, (req, res) => {
       return item;
     });
     const sorted = ranked.sort((a, b) => b.value - a.value);
-    const nonZero = sorted.filter(p => p.value > 0);
-    const finalRanked = (nonZero.length > 0 ? nonZero : sorted).slice(0, 20);
+    const filtered = sorted.filter(p => (p.username || '').toLowerCase() !== 'brian_gutierrez');
+    const nonZero = filtered.filter(p => p.value > 0);
+    const finalRanked = nonZero.slice(0, 20);
 
     res.json({ category, highscores: finalRanked });
   });

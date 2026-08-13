@@ -24,7 +24,7 @@ sampPool.getConnection((err, conn) => {
     console.error('Error connecting to SA-MP MySQL Pool: ' + err.message);
     return;
   }
-  console.log('✅ SA-MP MySQL Pool Initialized! Connection Thread ID: ' + conn.threadId);
+  console.log('SA-MP MySQL Pool Initialized! Connection Thread ID: ' + conn.threadId);
   conn.release();
 });
 
