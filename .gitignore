@@ -1,3 +1,10 @@
 node_modules
 .env
 test-db.js
+check-cols.js
+check_cols.js
+check_pass.js
+scratch_db_check.js
+insert_helper_data.js
+insert_staff.js
+import-schema.js

@@ -17,6 +17,14 @@ const nodemailer = require('nodemailer');
 const rateLimit = require('express-rate-limit');
 const dns = require('dns');
 
+process.on('uncaughtException', (err) => {
+  console.error('⚠️ Uncaught Exception in server process:', err.message);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('⚠️ Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
 if (dns.setDefaultResultOrder) {
   dns.setDefaultResultOrder('ipv4first');
 }
@@ -4418,16 +4426,18 @@ app.get('/admins', verifyPermission('tickets'), (req, res) => {
 });
 
 // ─── HELPER: Verify SA-MP Player Password ─────────────────
-async function verifySampPassword(inputPassword, storedHash, salt = '', username = '') {
+async function verifySampPassword(inputPassword, storedHash, salt = '', username = '', playerObj = null) {
   if (!storedHash || !inputPassword) return false;
   
   const cleanStored = storedHash.trim();
   const cleanInput = inputPassword.trim();
   const cleanSalt = (salt || '').toString().trim();
   const cleanUser = (username || '').toString().trim();
+  const userNoUnderscore = cleanUser.replace(/_/g, ' ').trim();
+  const userFirstPart = cleanUser.split('_')[0] || cleanUser;
 
   // 1. Direct plain text match
-  if (cleanInput === cleanStored) return true;
+  if (cleanInput === cleanStored || cleanInput.toLowerCase() === cleanStored.toLowerCase()) return true;
 
   // 2. bcrypt
   if (cleanStored.startsWith('$2a$') || cleanStored.startsWith('$2b$') || cleanStored.startsWith('$2y$')) {
@@ -4438,35 +4448,110 @@ async function verifySampPassword(inputPassword, storedHash, salt = '', username
     }
   }
 
-  // Helper to hash string with MD5, SHA256, Whirlpool
+  // Helpers
   const sha256 = (str) => crypto.createHash('sha256').update(str).digest('hex').toLowerCase();
+  const sha512 = (str) => crypto.createHash('sha512').update(str).digest('hex').toLowerCase();
   const md5 = (str) => crypto.createHash('md5').update(str).digest('hex').toLowerCase();
-  const whirlpool = (str) => {
+  
+  const getWhirlpool = (str) => {
+    const results = [];
+    let wpPackage = null;
     try {
-      return whirlpoolHelper(str).toLowerCase();
-    } catch {
-      return '';
+      const pkg = require('whirlpool-js');
+      wpPackage = (pkg && pkg.encSync) ? pkg : (pkg && pkg.default && pkg.default.encSync ? pkg.default : pkg);
+    } catch {}
+
+    const variations = [str, str + '\0', str + '\r\n', str + '\n'];
+
+    for (const v of variations) {
+      if (wpPackage && typeof wpPackage.encSync === 'function') {
+        try {
+          results.push(wpPackage.encSync(v, 'hex').toLowerCase());
+        } catch {}
+      }
+      try {
+        results.push(crypto.createHash('whirlpool').update(v).digest('hex').toLowerCase());
+      } catch {}
+      try {
+        results.push(whirlpoolHelper(v).toLowerCase());
+      } catch {}
+      try {
+        results.push(whirlpoolHelper(Buffer.from(v, 'latin1')).toLowerCase());
+      } catch {}
     }
+    return results;
   };
 
   const targetHash = cleanStored.toLowerCase();
-  const candidates = [
+
+  const candidateInputs = [
     cleanInput,
     cleanInput + cleanSalt,
     cleanSalt + cleanInput,
     cleanInput + cleanUser,
     cleanUser + cleanInput,
+    cleanUser.toLowerCase() + cleanInput,
+    cleanInput + cleanUser.toLowerCase(),
+    cleanUser.toUpperCase() + cleanInput,
+    cleanInput + cleanUser.toUpperCase(),
+    userNoUnderscore + cleanInput,
+    cleanInput + userNoUnderscore,
+    userFirstPart + cleanInput,
+    cleanInput + userFirstPart,
     cleanInput.toLowerCase(),
-    sha256(cleanInput),
-    md5(cleanInput)
+    cleanInput.toUpperCase(),
+    cleanInput.toLowerCase() + cleanSalt,
+    cleanSalt + cleanInput.toLowerCase(),
+    cleanInput.toUpperCase() + cleanSalt,
+    cleanSalt + cleanInput.toUpperCase(),
+    cleanInput + "paraiso",
+    "paraiso" + cleanInput,
+    cleanInput + "samp",
+    "samp" + cleanInput,
+    cleanInput + "pgaming",
+    cleanInput + "southcentral",
+    cleanInput + "horizon",
+    cleanInput + "westcoast",
+    cleanInput + "roleplay"
   ];
 
-  for (const cand of candidates) {
+  if (playerObj) {
+    if (playerObj.ID) {
+      candidateInputs.push(cleanInput + playerObj.ID, playerObj.ID + cleanInput);
+    }
+    if (playerObj.Key || playerObj.pKey) {
+      const k = String(playerObj.Key || playerObj.pKey);
+      candidateInputs.push(cleanInput + k, k + cleanInput);
+    }
+    if (playerObj.Salt || playerObj.salt) {
+      const s = String(playerObj.Salt || playerObj.salt);
+      candidateInputs.push(cleanInput + s, s + cleanInput);
+    }
+  }
+
+  for (const cand of candidateInputs) {
     if (sha256(cand) === targetHash) return true;
-    if (whirlpool(cand) === targetHash) return true;
     if (md5(cand) === targetHash) return true;
-    if (sha256(whirlpool(cand)) === targetHash) return true;
-    if (whirlpool(sha256(cand)) === targetHash) return true;
+    if (sha512(cand) === targetHash) return true;
+
+    const wpHashes = getWhirlpool(cand);
+    for (const w of wpHashes) {
+      if (w === targetHash) {
+        return true;
+      }
+      if (sha256(w) === targetHash) {
+        return true;
+      }
+      if (md5(w) === targetHash) return true;
+
+      // Double whirlpool check
+      const doubleWp = getWhirlpool(w);
+      for (const dw of doubleWp) {
+        if (dw === targetHash) {
+          return true;
+        }
+      }
+    }
   }
 
   return false;
@@ -4499,7 +4584,7 @@ function verifyUcpToken(req, res, next) {
       verifiedUser = jwt.verify(token, sec);
       break;
     } catch {
-      // ignore & try next secret
+      
     }
   }
 
@@ -4559,7 +4644,7 @@ app.post('/api/ucp/login', async (req, res) => {
       async (err, results) => {
         if (err) {
           console.error("SA-MP DB Login Error:", err);
-          return res.status(500).json({ message: "SA-MP database query error." });
+          return res.status(500).json({ message: "Something went wrong." });
         }
 
         if (!results || results.length === 0) {
@@ -4573,17 +4658,11 @@ app.post('/api/ucp/login', async (req, res) => {
           return res.status(403).json({ message: "This character account is currently banned from the server." });
         }
 
-        const salt = player.Salt || player.salt || player.Key || player.KeyHash || player.password_salt || '';
-        let isMatch = await verifySampPassword(password, player.Password, salt, player.Username);
-
-        // Non-Destructive Dynamic Auth: Allow UCP login for any existing character without modifying DB Password!
-        // This ensures the player's in-game password in SA-MP stays 100% working and untouched.
-        if (!isMatch && password && password.length >= 3) {
-          isMatch = true;
-        }
+        const salt = player.Salt || player.salt || player.Key || player.KeyHash || player.password_salt || player.pKey || player.PassKey || player.pSalt || player.SaltKey || player.HashKey || player.Secret || player.hash || '';
+        const isMatch = await verifySampPassword(password, player.Password, salt, player.Username, player);
 
         if (!isMatch) {
-          return res.status(401).json({ message: "Invalid character password. Please try again." });
+          return res.status(401).json({ message: "Password is not matched. Please enter your valid IG password." });
         }
 
         const userAgentStr = req.headers['user-agent'] || '';
@@ -4608,12 +4687,15 @@ app.post('/api/ucp/login', async (req, res) => {
         pSessions.unshift(newSession);
         if (pSessions.length > 10) pSessions.pop();
 
+        const rawAdminLevel = Number(player.AdminLevel || player.Admin || player.pAdmin || player.LevelAdmin || 0);
+
         const ucpPayload = {
           ucpPlayerId: player.ID,
           id: player.ID,
           username: player.Username,
           sessionId,
-          isSampUser: true
+          isSampUser: true,
+          adminLevel: rawAdminLevel
         };
 
         const token = jwt.sign(ucpPayload, UCP_JWT_SECRET, { expiresIn: '7d' });
@@ -4695,7 +4777,8 @@ function sanitizePlayerForUcp(player) {
     Job2: Number(player.Job2 || 0),
     MarriedTo: player.MarriedTo || player.Married || 'Nobody',
     LastLogin: player.LastLogin || player.LastConnect || null,
-    Online: Number(player.Online || 0)
+    Online: Number(player.Online || 0),
+    AdminLevel: Number(player.AdminLevel || player.Admin || player.pAdmin || player.LevelAdmin || 0)
   };
 }
 
@@ -5133,6 +5216,240 @@ app.post('/api/ucp/sessions/revoke-one', verifyUcpToken, (req, res) => {
   }
 
   res.json({ message: "Device session removed successfully." });
+});
+
+// ─── MIDDLEWARE: Verify In-Game Admin Level ──────────────────
+const verifyIgAdmin = (req, res, next) => {
+  // Check JWT first (available after re-login)
+  const jwtAdminLevel = Number(req.ucpUser.adminLevel || 0);
+  if (jwtAdminLevel > 0) {
+    req.igAdminLevel = jwtAdminLevel;
+    return next();
+  }
+
+  // Fallback: DB lookup with SELECT * to catch any column name
+  const playerId = req.ucpUser.ucpPlayerId || req.ucpUser.id;
+  const username = req.ucpUser.username;
+
+  sampDb.query(
+    "SELECT * FROM players WHERE ID = ? OR Username = ? LIMIT 1",
+    [playerId, username],
+    (err, results) => {
+      if (err || !results || results.length === 0) {
+        console.warn("[verifyIgAdmin] DB lookup failed:", err?.message);
+        return res.status(403).json({ message: "Access denied. Player record not found." });
+      }
+      const p = results[0];
+
+      // Log all keys so we can see the real column name in the server console
+      const allKeys = Object.keys(p);
+      const adminKeys = allKeys.filter(k => /admin/i.test(k));
+      console.log("[verifyIgAdmin] Admin-related columns found:", adminKeys.map(k => `${k}=${p[k]}`).join(', '));
+
+      // Try every possible variant
+      let adminLvl = 0;
+      for (const key of adminKeys) {
+        const val = Number(p[key] || 0);
+        if (val > adminLvl) adminLvl = val;
+      }
+      // Also check explicit known names just in case
+      adminLvl = Math.max(
+        adminLvl,
+        Number(p.AdminLevel || p.Admin || p.pAdmin || p.LevelAdmin || p.adminLevel || p.admin_level || 0)
+      );
+
+      console.log("[verifyIgAdmin] Resolved admin level:", adminLvl, "for player:", username);
+
+      if (adminLvl <= 0) {
+        return res.status(403).json({ message: "Access denied. In-Game Admin privileges required." });
+      }
+      req.igAdminLevel = adminLvl;
+      next();
+    }
+  );
+};
+
+// ─── GET /api/ucp/admin/online-players (IG Admin Online Player List) ────
+app.get('/api/ucp/admin/online-players', verifyUcpToken, verifyIgAdmin, (req, res) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+
+  const search = (req.query.search || '').trim();
+
+  const doQuery = (sql, params, cb) => sampDb.query(sql, params, cb);
+
+  const buildSanitized = (players) => (players || []).map(p => ({
+    id: Number(p.ID || p.id || 0),
+    username: p.Username || p.username || p.name || 'Unknown',
+    level: Number(p.Level || p.pLevel || 1),
+    health: Number(p.Health || p.pHealth || 100),
+    armor: Number(p.Armor || p.pArmor || 0),
+    adminLevel: Number(p.AdminLevel || p.Admin || p.pAdmin || p.LevelAdmin || 0),
+    faction: Number(p.Member || p.Leader || p.Faction || 0),
+    online: Number(p.Online || 0),
+    lastLogin: p.LastLogin || p.LastConnect || null,
+    connectTime: Number(p.ConnectTime || 0)
+  }));
+
+  if (search) {
+    doQuery(
+      "SELECT * FROM players WHERE Username LIKE ? OR ID = ? ORDER BY LastLogin DESC LIMIT 100",
+      [`%${search}%`, Number(search) || 0],
+      (err, players) => {
+        if (err) {
+          console.error("[online-players] Search query error:", err.message);
+          return res.status(500).json({ message: "Search query failed: " + err.message });
+        }
+        res.json({ onlinePlayers: buildSanitized(players), totalPlayers: (players || []).length });
+      }
+    );
+  } else {
+    doQuery(
+      "SELECT * FROM players ORDER BY Online DESC, LastLogin DESC LIMIT 200",
+      [],
+      (err, players) => {
+        if (err) {
+          console.error("[online-players] Query error:", err.message);
+          return res.status(500).json({ message: "Query failed: " + err.message });
+        }
+        res.json({ onlinePlayers: buildSanitized(players), totalPlayers: (players || []).length });
+      }
+    );
+  }
+});
+
+// ─── GET /api/ucp/admin/bans (IG Admin Ban & Locked Accounts List) ──────
+app.get('/api/ucp/admin/bans', verifyUcpToken, verifyIgAdmin, (req, res) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  sampDb.query(
+    "SELECT ID, Username, Level, AdminLevel, Banned, Permabanned, Warnings, WarningsCount FROM players WHERE Banned > 0 OR Permabanned > 0 OR Warnings > 0 OR WarningsCount > 0 ORDER BY Username ASC LIMIT 100",
+    (err, bannedPlayers) => {
+      if (err) {
+        // Fallback search
+        sampDb.query(
+          "SELECT ID, Username, Level, AdminLevel FROM players WHERE Banned > 0 LIMIT 100",
+          (err2, fallback) => {
+            res.json({ bannedPlayers: fallback || [] });
+          }
+        );
+      } else {
+        const sanitized = (bannedPlayers || []).map(b => ({
+          id: b.ID,
+          username: b.Username,
+          level: Number(b.Level || 1),
+          adminLevel: Number(b.AdminLevel || 0),
+          banned: Number(b.Banned || b.Permabanned || 0) > 0,
+          warnings: Number(b.Warnings || b.WarningsCount || 0)
+        }));
+        res.json({ bannedPlayers: sanitized });
+      }
+    }
+  );
+});
+
+// ─── POST /api/ucp/admin/action (Execute IG Admin Command) ─────────────
+app.post('/api/ucp/admin/action', verifyUcpToken, verifyIgAdmin, (req, res) => {
+  const { action, targetId, targetUsername, reason, value } = req.body;
+
+  if (!action) {
+    return res.status(400).json({ message: "Admin action is required." });
+  }
+
+  const queryTarget = targetId ? "ID = ?" : "Username = ?";
+  const queryParam = targetId || targetUsername;
+
+  if (!queryParam) {
+    return res.status(400).json({ message: "Target player ID or Username is required." });
+  }
+
+  // Level requirements for actions matching IG Pawn script
+  const levelReqs = {
+    'warn': 1,
+    'kick': 2,
+    'setvw': 2,
+    'setint': 2,
+    'setskin': 2,
+    'revive': 2,
+    'freeze': 2,
+    'unfreeze': 2,
+    'ban': 2,
+    'sethp': 3,
+    'setarmor': 3,
+    'unban': 3,
+    'setadmin': 5
+  };
+
+  const minLevel = levelReqs[action.toLowerCase()] || 2;
+  if (req.igAdminLevel < minLevel) {
+    return res.status(403).json({ message: `Required In-Game Admin Level ${minLevel}+ for action '${action}'.` });
+  }
+
+  let updateFields = "";
+  let queryArgs = [];
+
+  switch (action.toLowerCase()) {
+    case 'warn':
+      updateFields = "Warnings = COALESCE(Warnings, 0) + 1";
+      break;
+    case 'kick':
+      updateFields = "Online = 0";
+      break;
+    case 'ban':
+      updateFields = "Banned = 1, Online = 0";
+      break;
+    case 'unban':
+      updateFields = "Banned = 0";
+      break;
+    case 'sethp':
+      updateFields = "Health = ?";
+      queryArgs.push(Number(value || 100));
+      break;
+    case 'setarmor':
+      updateFields = "Armor = ?";
+      queryArgs.push(Number(value || 100));
+      break;
+    case 'setvw':
+      updateFields = "VirtualWorld = ?";
+      queryArgs.push(Number(value || 0));
+      break;
+    case 'setint':
+      updateFields = "Interior = ?";
+      queryArgs.push(Number(value || 0));
+      break;
+    case 'setskin':
+      updateFields = "Skin = ?";
+      queryArgs.push(Number(value || 0));
+      break;
+    case 'revive':
+      updateFields = "Health = 100";
+      break;
+    case 'freeze':
+    case 'unfreeze':
+      updateFields = "Health = Health"; // Marker
+      break;
+    case 'setadmin':
+      updateFields = "AdminLevel = ?";
+      queryArgs.push(Number(value || 0));
+      break;
+    default:
+      return res.status(400).json({ message: "Unsupported admin action." });
+  }
+
+  queryArgs.push(queryParam);
+
+  sampDb.query(
+    `UPDATE players SET ${updateFields} WHERE ${queryTarget}`,
+    queryArgs,
+    (err, result) => {
+      if (err) {
+        console.error("Error executing IG admin action:", err);
+        return res.status(500).json({ message: "Failed to execute admin action in database." });
+      }
+      res.json({
+        success: true,
+        message: `Admin action '${action.toUpperCase()}' successfully executed for ${targetUsername || ('ID #' + targetId)}.`
+      });
+    }
+  );
 });
 
 // ─── HOUSE & BUSINESS LOOKUP HELPERS ─────────────────────────
@@ -5629,6 +5946,537 @@ io.on('connection', (socket) => {
   });
 });
 
+// ─── GET /api/highscores (Public Leaderboard & Highscores) ─────────────────────
+app.get('/api/highscores', (req, res) => {
+  res.set('Cache-Control', 'public, max-age=300');
+  const category = (req.query.category || 'wealth').toLowerCase().trim();
+
+  // Helper map for job skill column names
+  const jobSkillCols = {
+    trucker: ['TruckSkill', 'pTruckSkill'],
+    mechanic: ['MechSkill', 'pMechSkill', 'MechanicSkill'],
+    arms: ['ArmsSkill', 'pArmsSkill', 'MaterialsSkill'],
+    detective: ['DetectiveSkill', 'DetSkill', 'pDetectiveSkill'],
+    lawyer: ['LawyerSkill', 'LawSkill', 'pLawyerSkill'],
+    drugs: ['DrugsSkill', 'pDrugsSkill'],
+    boxing: ['BoxWins', 'BoxingWins', 'pBoxWins', 'pBoxingWins', 'BoxSkill', 'BoxerSkill', 'BoxingSkill', 'pBoxerSkill', 'BoxWon', 'pBoxWon'],
+    fishing: ['FishSkill', 'FishingSkill', 'pFishSkill'],
+    carjacker: ['CarSkill', 'CarjackerSkill', 'pCarSkill'],
+    smuggler: ['SmugglerSkill', 'pSmugglerSkill'],
+    prostitute: ['SexSkill', 'WhoreSkill', 'pSexSkill']
+  };
+
+  if (category === 'cars') {
+    const vehicleNames = {
+      400: 'Landstalker', 401: 'Bravura', 402: 'Buffalo', 403: 'Linerunner', 404: 'Perennial',
+      405: 'Sentinel', 406: 'Dumper', 407: 'Firetruck', 408: 'Trashmaster', 409: 'Stretch',
+      410: 'Manana', 411: 'Infernus', 412: 'Voodoo', 413: 'Pony', 414: 'Mule', 415: 'Cheetah',
+      416: 'Ambulance', 417: 'Leviathan', 418: 'Moonbeam', 419: 'Esperanto', 420: 'Taxi',
+      421: 'Washington', 422: 'Bobcat', 423: 'Mr Whoopee', 424: 'BF Injection', 425: 'Hunter',
+      426: 'Premier', 427: 'Enforcer', 428: 'Securicar', 429: 'Banshee', 430: 'Predator',
+      431: 'Bus', 432: 'Rhino', 433: 'Barracks', 434: 'Hotknife', 435: 'Trailer', 436: 'Previon',
+      437: 'Coach', 438: 'Cabbie', 439: 'Stallion', 440: 'Rumpo', 441: 'RC Bandit', 442: 'Romero',
+      443: 'Packer', 444: 'Monster', 445: 'Admiral', 446: 'Squalo', 447: 'Seasparrow', 448: 'Pizzaboy',
+      449: 'Tram', 450: 'Trailer 2', 451: 'Turismo', 452: 'Speeder', 453: 'Reefer', 454: 'Tropic',
+      455: 'Flatbed', 456: 'Yankee', 457: 'Caddy', 458: 'Solair', 459: 'Topfun Van', 460: 'Skimmer',
+      461: 'PCJ-600', 462: 'Faggio', 463: 'Freeway', 464: 'RC Baron', 465: 'RC Raider', 466: 'Glendale',
+      467: 'Oceanic', 468: 'Sanchez', 469: 'Sparrow', 470: 'Patriot', 471: 'Quadbike', 472: 'Coastguard',
+      473: 'Dinghy', 474: 'Hermes', 475: 'Sabre', 476: 'Rustler', 477: 'ZR-350', 478: 'Walton',
+      479: 'Regina', 480: 'Comet', 481: 'BMX', 482: 'Burrito', 483: 'Camper', 484: 'Marquis',
+      485: 'Baggage', 486: 'Dozer', 487: 'Maverick', 488: 'SAN News Mav', 489: 'Rancher', 490: 'FBI Rancher',
+      491: 'Virgo', 492: 'Greenwood', 493: 'Jetmax', 494: 'Hotring Racer', 495: 'Sandking',
+      496: 'Blista Compact', 497: 'Police Mav', 498: 'Boxville', 499: 'Benson', 500: 'Mesa',
+      501: 'RC Goblin', 502: 'Hotring 2', 503: 'Hotring 3', 504: 'Bloodring', 505: 'Rancher Lure',
+      506: 'Super GT', 507: 'Elegant', 508: 'Journey', 509: 'Bike', 510: 'Mountain Bike',
+      511: 'Beagle', 512: 'Cropduster', 513: 'Stuntplane', 514: 'Tanker', 515: 'Roadtrain',
+      516: 'Nebula', 517: 'Majestic', 518: 'Buccaneer', 519: 'Shamal', 520: 'Hydra', 521: 'FCR-900',
+      522: 'NRG-500', 523: 'HPV-1000', 524: 'Cement Truck', 525: 'Towtruck', 526: 'Fortune',
+      527: 'Cadrona', 528: 'FBI Truck', 529: 'Willard', 530: 'Forklift', 531: 'Tractor',
+      532: 'Combine', 533: 'Feltzer', 534: 'Remington', 535: 'Slamvan', 536: 'Blade', 537: 'Freight',
+      538: 'Streak', 539: 'Vortex', 540: 'Vincent', 541: 'Bullet', 542: 'Clover', 543: 'Sadler',
+      544: 'Firetruck LA', 545: 'Hustler', 546: 'Intruder', 547: 'Primo', 548: 'Cargobob', 549: 'Tampa',
+      550: 'Sunrise', 551: 'Merit', 552: 'Utility Van', 553: 'Nevada', 554: 'Yosemite', 555: 'Windsor',
+      556: 'Monster 2', 557: 'Monster 3', 558: 'Uranus', 559: 'Jester', 560: 'Sultan', 561: 'Stratum',
+      562: 'Elegy', 563: 'Raindance', 564: 'RC Tiger', 565: 'Flash', 566: 'Tahoma', 567: 'Savanna',
+      568: 'Bandito', 571: 'Kart', 572: 'Mower', 573: 'Dune', 574: 'Sweeper', 575: 'Broadway',
+      576: 'Tornado', 577: 'AT-400', 578: 'DFT-30', 579: 'Huntley', 580: 'Stafford', 581: 'BF-400',
+      582: 'Newsvan', 583: 'Tug', 585: 'Emperor', 586: 'Wayfarer', 587: 'Euro', 588: 'Hotdog',
+      589: 'Club', 592: 'Andromada', 593: 'Dodo', 594: 'RC Cam', 595: 'Launch', 596: 'Police LSPD',
+      597: 'Police SFPD', 598: 'Police LVPD', 599: 'Police Ranger', 600: 'Picador', 601: 'SWAT Tank',
+      602: 'Alpha', 603: 'Phoenix', 604: 'Glendale Shit', 605: 'Sadler Shit'
+    };
+
+    const processVehiclesData = (vehicles) => {
+      if (!vehicles || vehicles.length === 0) return [];
+      const modelCounts = {};
+      vehicles.forEach(v => {
+        const modelId = Number(v.Model || v.VehicleModel || v.vModel || v.cModel || v.model || v.ModelID || v.v_model || v.car_model || v.CarModel || 0);
+        if (modelId >= 400 && modelId <= 611) {
+          modelCounts[modelId] = (modelCounts[modelId] || 0) + 1;
+        }
+      });
+
+      return Object.keys(modelCounts)
+        .map(model => {
+          const mId = Number(model);
+          const nameStr = vehicleNames[mId] || `Vehicle #${mId}`;
+          return {
+            name: `${mId}`,
+            modelName: nameStr,
+            modelId: mId,
+            value: modelCounts[mId],
+            unit: ''
+          };
+        })
+        .sort((a, b) => b.value - a.value)
+        .slice(0, 20);
+    };
+
+    // Query vehicles table with fallbacks for player_vehicles and cars tables
+    sampDb.query("SELECT * FROM vehicles LIMIT 5000", (err, vehicles) => {
+      if (!err && vehicles && vehicles.length > 0) {
+        return res.json({ category, highscores: processVehiclesData(vehicles) });
+      }
+      sampDb.query("SELECT * FROM player_vehicles LIMIT 5000", (err2, pVehicles) => {
+        if (!err2 && pVehicles && pVehicles.length > 0) {
+          return res.json({ category, highscores: processVehiclesData(pVehicles) });
+        }
+        sampDb.query("SELECT * FROM cars LIMIT 5000", (err3, cVehicles) => {
+          if (!err3 && cVehicles && cVehicles.length > 0) {
+            return res.json({ category, highscores: processVehiclesData(cVehicles) });
+          }
+          return res.json({ category, highscores: [] });
+        });
+      });
+    });
+    return;
+  }
+
+  if (category === 'crimes') {
+    const processCrimesData = (rows) => {
+      if (!rows || rows.length === 0) return [];
+      const crimeCounts = {};
+      rows.forEach(r => {
+        const rawCharge = r.Charge || r.Crime || r.crime || r.charge || r.Reason || r.reason || r.CrimeName || r.crime_name || r.Detail || r.Offense || '';
+        const chargeName = rawCharge.toString().trim();
+        if (chargeName && chargeName !== '0' && chargeName !== 'None' && chargeName !== 'null' && isNaN(Number(chargeName))) {
+          const countVal = Number(r.count || r.Amount || r.amount || 1);
+          crimeCounts[chargeName] = (crimeCounts[chargeName] || 0) + countVal;
+        }
+      });
+
+      return Object.keys(crimeCounts)
+        .map(charge => ({
+          name: charge,
+          value: crimeCounts[charge],
+          unit: ''
+        }))
+        .sort((a, b) => b.value - a.value)
+        .slice(0, 20);
+    };
+
+    // Query real DB tables in sequence (crimes -> charges -> mdc_crimes -> arrests -> players)
+    sampDb.query("SELECT * FROM crimes LIMIT 5000", (err1, r1) => {
+      if (!err1 && r1 && r1.length > 0) {
+        const resList = processCrimesData(r1);
+        if (resList.length > 0) return res.json({ category, highscores: resList });
+      }
+      sampDb.query("SELECT * FROM charges LIMIT 5000", (err2, r2) => {
+        if (!err2 && r2 && r2.length > 0) {
+          const resList = processCrimesData(r2);
+          if (resList.length > 0) return res.json({ category, highscores: resList });
+        }
+        sampDb.query("SELECT * FROM mdc_crimes LIMIT 5000", (err3, r3) => {
+          if (!err3 && r3 && r3.length > 0) {
+            const resList = processCrimesData(r3);
+            if (resList.length > 0) return res.json({ category, highscores: resList });
+          }
+          sampDb.query("SELECT * FROM arrests LIMIT 5000", (err4, r4) => {
+            if (!err4 && r4 && r4.length > 0) {
+              const resList = processCrimesData(r4);
+              if (resList.length > 0) return res.json({ category, highscores: resList });
+            }
+            sampDb.query("SELECT * FROM players LIMIT 1000", (err5, players) => {
+              if (err5 || !players) return res.json({ category, highscores: [] });
+              const counts = {};
+              players.forEach(p => {
+                const c = p.CrimeRecord || p.MainCrime || p.pCrimeRecord || p.ChargesRecord || p.WantedReason;
+                if (c && typeof c === 'string' && c.trim() !== '' && c !== 'None' && c !== '0' && isNaN(Number(c))) {
+                  const parts = c.split(/[,;|]/);
+                  parts.forEach(pt => {
+                    const clean = pt.trim();
+                    if (clean && clean !== '0' && clean !== 'None' && isNaN(Number(clean))) {
+                      counts[clean] = (counts[clean] || 0) + 1;
+                    }
+                  });
+                }
+              });
+              const list = Object.keys(counts)
+                .map(chg => ({ name: chg, value: counts[chg], unit: '' }))
+                .sort((a, b) => b.value - a.value)
+                .slice(0, 20);
+
+              return res.json({ category, highscores: list });
+            });
+          });
+        });
+      });
+    });
+    return;
+  }
+
+  if (category === 'factions-roster' || category === 'factions-wealth') {
+    sampDb.query("SELECT * FROM factions LIMIT 100", (errF, fRows) => {
+      sampDb.query("SELECT * FROM families LIMIT 100", (errFam, famRows) => {
+        sampDb.query("SELECT * FROM gangs LIMIT 100", (errG, gRows) => {
+          
+          const defaultFactionMeta = {
+            1: 'Paraiso Police Department',
+            2: 'Federal Bureau of Investigation',
+            3: 'Paraiso Fire & Medic Department',
+            4: 'Paraiso San Andreas News',
+            5: 'Paraiso National Guard',
+            6: 'Government',
+            7: 'Grove Street Families',
+            8: '18th Street Pacris Fraternity',
+            9: 'La Cosa Nostra',
+            10: 'Hoodlum Outcast',
+            11: 'The Young Lords',
+            12: 'Hitman Agency',
+            13: 'The Sovereignty'
+          };
+
+          const dynamicMeta = {};
+
+          if (!errF && fRows && fRows.length > 0) {
+            fRows.forEach(r => {
+              const fid = Number(r.id || r.ID || r.fId || r.FactionID || 0);
+              const fname = (r.name || r.Name || r.FactionName || '').toString().trim();
+              if (fid > 0 && fname) dynamicMeta[`faction_${fid}`] = fname;
+            });
+          }
+
+          if (!errFam && famRows && famRows.length > 0) {
+            famRows.forEach(r => {
+              const gid = Number(r.id || r.ID || r.fId || r.FamilyID || r.GangID || 0);
+              const gname = (r.name || r.Name || r.FamilyName || r.GangName || '').toString().trim();
+              if (gid > 0 && gname) dynamicMeta[`family_${gid}`] = gname;
+            });
+          }
+
+          if (!errG && gRows && gRows.length > 0) {
+            gRows.forEach(r => {
+              const gid = Number(r.id || r.ID || r.fId || r.GangID || 0);
+              const gname = (r.name || r.Name || r.GangName || '').toString().trim();
+              if (gid > 0 && gname && !dynamicMeta[`family_${gid}`]) {
+                dynamicMeta[`family_${gid}`] = gname;
+              }
+            });
+          }
+
+          sampDb.query("SELECT * FROM players LIMIT 1000", (errP, players) => {
+            if (errP || !players) return res.json({ category, highscores: [] });
+
+            const factionsData = {};
+
+            // Pre-initialize any dynamic Faction/Gang found in DB tables
+            Object.keys(dynamicMeta).forEach(key => {
+              const fid = Number(key.replace('faction_', '').replace('family_', ''));
+              if (fid > 0 && fid !== 255 && fid !== 12) {
+                factionsData[key] = {
+                  id: fid,
+                  name: dynamicMeta[key],
+                  members: 0,
+                  totalWealth: 0
+                };
+              }
+            });
+
+            players.forEach(p => {
+              const cash = Number(p.Cash ?? p.pMoney ?? p.Money ?? 0);
+              const bank = Number(p.Bank ?? p.pBank ?? 0);
+              const wealth = cash + bank;
+
+              // Check Faction / Gang ID (ignore 0, 255, 12-hitman)
+              const fId = Number(p.Member || p.Leader || p.Faction || p.pMember || p.pLeader || p.Fequipe || p.Family || p.Gang || p.pFequipe || p.pFamily || p.pGang || 0);
+              
+              if (fId > 0 && fId !== 255 && fId !== 12) {
+                const key = `faction_${fId}`;
+                if (!factionsData[key]) {
+                  const fname = dynamicMeta[key] || dynamicMeta[`family_${fId}`] || defaultFactionMeta[fId] || `Faction #${fId}`;
+                  factionsData[key] = { id: fId, name: fname, members: 0, totalWealth: 0 };
+                }
+                factionsData[key].members += 1;
+                factionsData[key].totalWealth += wealth;
+              }
+            });
+
+            // Add stash cash from database tables
+            if (fRows && fRows.length > 0) {
+              fRows.forEach(r => {
+                const fid = Number(r.id || r.ID || r.fId || r.FactionID || 0);
+                const stash = Number(r.Bank || r.Vault || r.Stash || r.Safe || r.Money || r.fBank || r.fVault || r.Cash || 0);
+                if (fid > 0 && factionsData[`faction_${fid}`]) factionsData[`faction_${fid}`].totalWealth += stash;
+              });
+            }
+
+            if (famRows && famRows.length > 0) {
+              famRows.forEach(r => {
+                const gid = Number(r.id || r.ID || r.fId || r.FamilyID || r.GangID || 0);
+                const stash = Number(r.Bank || r.Vault || r.Stash || r.Safe || r.Money || r.fBank || r.fVault || r.Cash || 0);
+                if (gid > 0 && factionsData[`faction_${gid}`]) factionsData[`faction_${gid}`].totalWealth += stash;
+              });
+            }
+
+            const list = Object.values(factionsData)
+              .filter(f => f.id !== 255 && f.id !== 0 && f.id !== 12 && !f.name.toLowerCase().includes('hitman'))
+              .map(f => ({
+                id: f.id,
+                name: f.name,
+                value: category === 'factions-roster' ? f.members : f.totalWealth,
+                unit: category === 'factions-roster' ? 'Members' : '$'
+              }));
+
+            list.sort((a, b) => b.value - a.value);
+            return res.json({ category, highscores: list.slice(0, 20) });
+          });
+        });
+      });
+    });
+    return;
+  }
+
+  if (category === 'kills') {
+    sampDb.query("SELECT * FROM kills LIMIT 5000", (errK, killRows) => {
+      sampDb.query("SELECT * FROM players LIMIT 1000", (errP, players) => {
+        if (errP || !players) players = [];
+        
+        const playerMapById = {};
+        const playerMapByName = {};
+        players.forEach(p => {
+          const pid = Number(p.ID ?? p.id ?? 0);
+          const uname = p.Username || p.username || '';
+          if (pid > 0 && uname) playerMapById[pid] = uname;
+          if (uname) playerMapByName[uname.toLowerCase()] = p;
+        });
+
+        const killCounts = {};
+
+        if (!errK && killRows && killRows.length > 0) {
+          killRows.forEach(r => {
+            let killerVal = r.Killer || r.killer || r.killer_id || r.killerid || r.KillerID || r.KillerName || r.killer_name || r.Player || r.Username || r.username || r.char_id || r.character_id || r.player_id || Object.values(r)[1] || Object.values(r)[0] || '';
+            killerVal = killerVal ? killerVal.toString().trim() : '';
+            
+            let resolvedName = '';
+            if (!isNaN(Number(killerVal)) && Number(killerVal) > 0) {
+              resolvedName = playerMapById[Number(killerVal)] || '';
+            } else if (killerVal && killerVal !== '0' && killerVal !== 'None' && killerVal !== 'null') {
+              resolvedName = killerVal;
+            }
+
+            if (resolvedName) {
+              killCounts[resolvedName] = (killCounts[resolvedName] || 0) + 1;
+            }
+          });
+        }
+
+        const killList = Object.keys(killCounts)
+          .map(k => {
+            const pObj = playerMapByName[k.toLowerCase()] || {};
+            return {
+              name: k,
+              username: k,
+              skin: Number(pObj.Skin ?? pObj.pSkin ?? 299),
+              value: killCounts[k],
+              unit: 'Kills'
+            };
+          })
+          .sort((a, b) => b.value - a.value)
+          .slice(0, 20);
+
+        if (killList.length > 0) {
+          return res.json({ category, highscores: killList });
+        }
+
+        // Fallback: list players sorted by Kills or Level
+        const fallbackList = players.map(p => ({
+          id: Number(p.ID ?? p.id ?? 0),
+          username: p.Username || p.username || 'Unknown',
+          level: Number(p.Level ?? p.pLevel ?? 1),
+          skin: Number(p.Skin ?? p.pSkin ?? 299),
+          value: Number(p.PaintballKills ?? p.pPaintballKills ?? p.PBKills ?? p.pPBKills ?? p.Paintball ?? p.PBK ?? p.Kills ?? p.pKills ?? p.Killed ?? 0),
+          unit: 'Kills'
+        }));
+        fallbackList.sort((a, b) => b.value - a.value);
+        return res.json({ category, highscores: fallbackList.slice(0, 20) });
+      });
+    });
+    return;
+  }
+
+  if (category === 'arrests') {
+    sampDb.query("SELECT * FROM players LIMIT 1000", (errP, players) => {
+      if (errP || !players) return res.json({ category, highscores: [] });
+
+      const ranked = players.map(p => {
+        const uname = p.Username || p.username || 'Unknown';
+        const crimesVal = Number(p.Crimes ?? p.pCrimes ?? p.CrimesCommitted ?? 0);
+        const arrestsVal = Number(p.Arrested ?? p.Arrests ?? p.pArrests ?? 0);
+
+        return {
+          id: Number(p.ID ?? p.id ?? 0),
+          username: uname,
+          level: Number(p.Level ?? p.pLevel ?? 1),
+          skin: Number(p.Skin ?? p.pSkin ?? 299),
+          crimes: crimesVal,
+          arrests: arrestsVal,
+          value: crimesVal,
+          unit: 'Crimes'
+        };
+      });
+
+      ranked.sort((a, b) => b.value - a.value);
+      const top20 = ranked.slice(0, 20);
+
+      return res.json({ category, highscores: top20 });
+    });
+    return;
+  }
+
+  if (category === 'skins') {
+    sampDb.query("SELECT * FROM players LIMIT 1000", (err, players) => {
+      if (err || !players) return res.json({ category, highscores: [] });
+
+      const skinCounts = {};
+      players.forEach(p => {
+        const skinId = Number(p.Skin ?? p.pSkin ?? 0);
+        if (skinId >= 0) {
+          skinCounts[skinId] = (skinCounts[skinId] || 0) + 1;
+        }
+      });
+
+      const sorted = Object.keys(skinCounts)
+        .map(skin => ({
+          name: `Skin ID #${skin}`,
+          skin: Number(skin),
+          skinId: Number(skin),
+          value: skinCounts[skin],
+          unit: 'Players'
+        }))
+        .sort((a, b) => b.value - a.value)
+        .slice(0, 20);
+
+      return res.json({ category, highscores: sorted });
+    });
+    return;
+  }
+
+  // Standard Player Leaderboard
+  sampDb.query("SELECT * FROM players LIMIT 1000", (err, players) => {
+    if (err || !players || players.length === 0) {
+      return res.json({ category, highscores: [] });
+    }
+
+    const mapPlayerVal = (p) => {
+      if (category === 'wealth') {
+        const cash = Number(p.Cash ?? p.pMoney ?? p.Money ?? 0);
+        const bank = Number(p.Bank ?? p.pBank ?? 0);
+        return cash + bank;
+      }
+      if (category === 'materials') {
+        return Number(p.Materials ?? p.pMaterials ?? 0);
+      }
+      if (category === 'kills') {
+        return Number(p.PaintballKills ?? p.pPaintballKills ?? p.PBKills ?? p.pPBKills ?? p.Paintball ?? p.pPaintball ?? p.PBK ?? p.PaintBallKills ?? p.pPaintBallKills ?? p.Kills ?? p.pKills ?? p.Killed ?? 0);
+      }
+      if (category === 'hours') {
+        return Number(p.ConnectTime ?? p.pConnectTime ?? p.Hours ?? 0);
+      }
+      if (category === 'arrests') {
+        return Number(p.Arrests ?? p.Arrested ?? p.pArrests ?? 0);
+      }
+      if (category === 'lawyer') {
+        return Number(p.LawyerFreed ?? p.pLawyerFreed ?? p.Freed ?? p.pFreed ?? p.LawyerFree ?? p.pLawyerFree ?? p.Free ?? p.pFree ?? p.LawyerSkill ?? p.pLawyerSkill ?? p.LawSkill ?? 0);
+      }
+      if (category === 'detective') {
+        return Number(p.DetectiveSkill ?? p.pDetectiveSkill ?? p.Finds ?? p.pFinds ?? p.Found ?? p.pFound ?? p.DetSkill ?? p.pDetSkill ?? 0);
+      }
+      if (category === 'arms') {
+        return Number(p.GunsMade ?? p.pGunsMade ?? p.WeaponsMade ?? p.pWeaponsMade ?? p.ArmsMade ?? p.pArmsMade ?? p.ArmsSkill ?? p.pArmsSkill ?? p.MaterialsSkill ?? p.pMaterialsSkill ?? 0);
+      }
+      if (category === 'mechanic') {
+        return Number(p.Repaired ?? p.pRepaired ?? p.MechanicRepairs ?? p.pMechanicRepairs ?? p.MechRepairs ?? p.pMechRepairs ?? p.Repairs ?? p.pRepairs ?? p.MechSkill ?? p.pMechSkill ?? p.MechanicSkill ?? 0);
+      }
+      if (category === 'boxing') {
+        return Number(p.BoxWins ?? p.pBoxWins ?? p.BoxingWins ?? p.pBoxingWins ?? p.BoxWon ?? p.pBoxWon ?? p.FightsWon ?? p.pFightsWon ?? p.FightWins ?? p.pFightWins ?? p.BoxerWins ?? p.pBoxerWins ?? p.BoxSkill ?? p.pBoxSkill ?? p.BoxingSkill ?? p.pBoxingSkill ?? 0);
+      }
+      if (category === 'fishing') {
+        return Number(p.FishCaught ?? p.pFishCaught ?? p.FishesCaught ?? p.pFishesCaught ?? p.Fishes ?? p.pFishes ?? p.Fish ?? p.pFish ?? p.FishSkill ?? p.pFishSkill ?? p.FishingSkill ?? p.pFishingSkill ?? 0);
+      }
+      if (category === 'trucker') {
+        return Number(p.Deliveries ?? p.pDeliveries ?? p.TruckerRuns ?? p.pTruckerRuns ?? p.TruckRuns ?? p.pTruckRuns ?? p.TruckSkill ?? p.pTruckSkill ?? p.TruckerSkill ?? 0);
+      }
+      if (category === 'carjacker') {
+        return Number(p.CarsStolen ?? p.pCarsStolen ?? p.CarsSold ?? p.pCarsSold ?? p.Carjacker ?? p.pCarjacker ?? p.CarSkill ?? p.pCarSkill ?? p.CarjackerSkill ?? 0);
+      }
+
+      // Check job skill columns
+      if (jobSkillCols[category]) {
+        for (const col of jobSkillCols[category]) {
+          if (p[col] !== undefined && p[col] !== null) {
+            return Number(p[col]);
+          }
+        }
+      }
+
+      return Number(p.Level ?? 1);
+    };
+
+    const unitMap = {
+      wealth: '$',
+      materials: 'Mats',
+      kills: 'Kills',
+      hours: 'Hrs',
+      arrests: 'Arrests',
+      crimes: 'Crimes',
+      trucker: '',
+      mechanic: '',
+      arms: '',
+      detective: '',
+      lawyer: '',
+      drugs: '',
+      boxing: '',
+      fishing: '',
+      carjacker: '',
+      smuggler: '',
+      prostitute: ''
+    };
+
+    const ranked = players.map(p => {
+      const item = {
+        id: Number(p.ID ?? p.id ?? 0),
+        username: p.Username || p.username || 'Unknown',
+        level: Number(p.Level ?? p.pLevel ?? 1),
+        skin: Number(p.Skin ?? p.pSkin ?? 299),
+        value: mapPlayerVal(p),
+        unit: unitMap[category] !== undefined ? unitMap[category] : ''
+      };
+
+      if (category === 'crimes' || category === 'arrests') {
+        const cName = p.CrimeRecord || p.MainCrime || p.pCrimeRecord || p.Crime || p.ChargesRecord;
+        if (cName) item.crimeName = cName;
+      }
+
+      return item;
+    });
+    const sorted = ranked.sort((a, b) => b.value - a.value);
+    const nonZero = sorted.filter(p => p.value > 0);
+    const finalRanked = (nonZero.length > 0 ? nonZero : sorted).slice(0, 20);
+
+    res.json({ category, highscores: finalRanked });
+  });
+});
+
 server.listen(5000, () => console.log("Server is running on port 5000"));
 
 app.get('/api/ucp/debug-tables', (req, res) => {
@@ -5651,6 +6499,103 @@ app.get('/api/ucp/debug-tables', (req, res) => {
           });
         });
       });
+    });
+  });
+});
+
+app.get('/api/debug/player-columns', (req, res) => {
+  sampDb.query("SHOW TABLES", (errT, tables) => {
+    const tableList = tables ? tables.map(t => Object.values(t)[0]) : [];
+    sampDb.query("DESCRIBE players", (err, cols) => {
+      if (err || !cols) return res.json({ tables: tableList, error: err ? err.message : 'No columns found' });
+      const allFields = cols.map(c => c.Field);
+      
+      sampDb.query("SELECT * FROM players LIMIT 1", (errP, players) => {
+        const sample = players && players[0] ? players[0] : {};
+
+        const killTables = tableList.filter(t => /kill|arena|pb|paintball|event|dm|stat|match/i.test(t));
+        const killCols = allFields.filter(f => /kill|death|arena|event|match|dm|kd|stat|win/i.test(f));
+
+        sampDb.query("DESCRIBE kills", (errK, kCols) => {
+          sampDb.query("SELECT * FROM kills LIMIT 3", (errK1, kSample) => {
+            res.json({
+              killsTableColumns: kCols ? kCols.map(c => c.Field) : null,
+              killsTableSample: kSample || [],
+              potentialKillTables: killTables,
+              potentialKillColumns: killCols,
+              databaseTables: tableList,
+              totalPlayerColumns: allFields.length,
+              sampleRecord: sample
+            });
+          });
+        });
+      });
+    });
+  });
+});
+
+app.get('/api/debug/crime-columns', (req, res) => {
+  sampDb.query("SHOW TABLES", (errT, tables) => {
+    const tableList = tables ? tables.map(t => Object.values(t)[0]) : [];
+    const crimeTables = tableList.filter(t => /crime|arrest|jail|wanted|mdc/i.test(t));
+    
+    sampDb.query("DESCRIBE players", (err, cols) => {
+      if (err || !cols) return res.json({ crimeTables, error: err ? err.message : 'No columns' });
+      const allFields = cols.map(c => c.Field);
+      const crimeCols = allFields.filter(f => /crime|arrest|jail|wanted|mdc|charge/i.test(f));
+
+      sampDb.query("SELECT Username, Crimes, Arrested, WantedLevel, Jailed, JailTime FROM players LIMIT 10", (errP, players) => {
+        res.json({
+          crimeAndArrestTables: crimeTables,
+          crimeAndArrestColumnsInPlayers: crimeCols,
+          playersData: players || [],
+        });
+      });
+    });
+  });
+});
+
+app.get('/api/debug/factions', (req, res) => {
+  sampDb.query("DESCRIBE factions", (errF1, colsF) => {
+    sampDb.query("DESCRIBE families", (errFam1, colsFam) => {
+      sampDb.query("DESCRIBE gangs", (errG1, colsG) => {
+        sampDb.query("SELECT * FROM factions LIMIT 10", (errF, factions) => {
+          sampDb.query("SELECT * FROM families LIMIT 10", (errFam, families) => {
+            sampDb.query("SELECT * FROM gangs LIMIT 10", (errG, gangs) => {
+              res.json({
+                factionsColumns: colsF ? colsF.map(c => c.Field) : (errF1 ? errF1.message : null),
+                familiesColumns: colsFam ? colsFam.map(c => c.Field) : (errFam1 ? errFam1.message : null),
+                gangsColumns: colsG ? colsG.map(c => c.Field) : (errG1 ? errG1.message : null),
+                factionsSample: factions || [],
+                familiesSample: families || [],
+                gangsSample: gangs || []
+              });
+            });
+          });
+        });
+      });
+    });
+  });
+});
+
+app.get('/api/debug/all-columns', (req, res) => {
+  sampDb.query(`
+    SELECT TABLE_NAME, COLUMN_NAME 
+    FROM INFORMATION_SCHEMA.COLUMNS 
+    WHERE TABLE_SCHEMA = DATABASE() 
+    ORDER BY TABLE_NAME, ORDINAL_POSITION
+  `, (err, rows) => {
+    if (err || !rows) return res.json({ error: err ? err.message : 'Database error' });
+
+    const result = {};
+    rows.forEach(r => {
+      if (!result[r.TABLE_NAME]) result[r.TABLE_NAME] = [];
+      result[r.TABLE_NAME].push(r.COLUMN_NAME);
+    });
+
+    res.json({
+      totalTables: Object.keys(result).length,
+      allTablesAndColumns: result
     });
   });
 });
