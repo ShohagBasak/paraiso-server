@@ -92,7 +92,7 @@ const registerLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-// ─── Highscores API Rate Limiter ───
+// Highscores API Rate Limiter 
 const highscoresLimiter = rateLimit({
   windowMs: 1 * 60 * 1000, 
   max: 30, 
@@ -141,7 +141,8 @@ const FRONTEND_BASE_URL = (process.env.FRONTEND_URL || 'http://localhost:5173').
 
 app.use(cors({ 
   origin: allowedOrigins, 
-  credentials: true 
+  credentials: true,
+  exposedHeaders: ['RateLimit-Limit', 'RateLimit-Remaining', 'RateLimit-Reset', 'Retry-After'], 
 }));
 
 const isProduction = process.env.NODE_ENV === 'production' || (process.env.FRONTEND_URL && !process.env.FRONTEND_URL.includes('localhost'));
@@ -5965,8 +5966,8 @@ io.on('connection', (socket) => {
   });
 });
 
-// ─── GET /api/highscores (Public Leaderboard & Highscores) ─────────────────────
-app.get('/api/highscores', highscoresLimiter, (req, res) => {
+// GET /api/highscores (Public Leaderboard & Highscores) 
+app.get('/api/highscores',highscoresLimiter, (req, res) => {
   res.set('Cache-Control', 'public, max-age=300');
   const category = (req.query.category || 'wealth').toLowerCase().trim();
 
