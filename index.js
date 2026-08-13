@@ -73,6 +73,16 @@ const app = express();
 app.set('trust proxy', 1);
 const server = http.createServer(app);
 
+// ─── Security Headers Middleware (Anti-XSS, Clickjacking, MIME-Sniffing Protection) ───
+app.use((req, res, next) => {
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  next();
+});
+
 // ─── Rate Limiter for Registration & OTP ───
 const registerLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
@@ -81,6 +91,17 @@ const registerLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
 });
+
+// ─── Highscores API Rate Limiter ───
+const highscoresLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000, // 1 minute
+  max: 60, // Max 60 requests per minute per IP
+  message: { message: "Too many requests to Highscores API from this IP. Please try again after a minute." },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+app.use('/api/highscores', highscoresLimiter);
 
 // ─── Nodemailer Transporter ───
 const getTransporter = () => {
