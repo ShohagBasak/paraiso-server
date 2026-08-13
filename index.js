@@ -94,14 +94,12 @@ const registerLimiter = rateLimit({
 
 // ─── Highscores API Rate Limiter ───
 const highscoresLimiter = rateLimit({
-  windowMs: 1 * 60 * 1000, // 1 minute
-  max: 60, // Max 60 requests per minute per IP
-  message: { message: "Too many requests to Highscores API from this IP. Please try again after a minute." },
+  windowMs: 1 * 60 * 1000, 
+  max: 30, 
+  message: { error: "Too Many Requests", message: "Highscores API rate limit exceeded. Please wait 1 minute." },
   standardHeaders: true,
   legacyHeaders: false,
 });
-
-app.use('/api/highscores', highscoresLimiter);
 
 // ─── Nodemailer Transporter ───
 const getTransporter = () => {
@@ -5968,7 +5966,7 @@ io.on('connection', (socket) => {
 });
 
 // ─── GET /api/highscores (Public Leaderboard & Highscores) ─────────────────────
-app.get('/api/highscores', (req, res) => {
+app.get('/api/highscores', highscoresLimiter, (req, res) => {
   res.set('Cache-Control', 'public, max-age=300');
   const category = (req.query.category || 'wealth').toLowerCase().trim();
 
