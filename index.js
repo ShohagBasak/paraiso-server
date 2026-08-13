@@ -6321,7 +6321,6 @@ app.get('/api/highscores', (req, res) => {
 
         // Fallback: list players sorted by Kills or Level
         const fallbackList = players.map(p => ({
-          id: Number(p.ID ?? p.id ?? 0),
           username: p.Username || p.username || 'Unknown',
           level: Number(p.Level ?? p.pLevel ?? 1),
           skin: Number(p.Skin ?? p.pSkin ?? 299),
@@ -6345,7 +6344,6 @@ app.get('/api/highscores', (req, res) => {
         const arrestsVal = Number(p.Arrested ?? p.Arrests ?? p.pArrests ?? 0);
 
         return {
-          id: Number(p.ID ?? p.id ?? 0),
           username: uname,
           level: Number(p.Level ?? p.pLevel ?? 1),
           skin: Number(p.Skin ?? p.pSkin ?? 299),
@@ -6475,7 +6473,6 @@ app.get('/api/highscores', (req, res) => {
 
     const ranked = players.map(p => {
       const item = {
-        id: Number(p.ID ?? p.id ?? 0),
         username: p.Username || p.username || 'Unknown',
         level: Number(p.Level ?? p.pLevel ?? 1),
         skin: Number(p.Skin ?? p.pSkin ?? 299),
