@@ -6384,13 +6384,13 @@ app.get('/api/highscores', (req, res) => {
         return cash + bank;
       }
       if (category === 'materials') {
-        return Number(p.Materials ?? p.pMaterials ?? 0);
+        return Number(p.Materials ?? p.pMaterials ?? p.Mats ?? p.pMats ?? 0);
       }
       if (category === 'kills') {
         return Number(p.PaintballKills ?? p.pPaintballKills ?? p.PBKills ?? p.pPBKills ?? p.Paintball ?? p.pPaintball ?? p.PBK ?? p.PaintBallKills ?? p.pPaintBallKills ?? p.Kills ?? p.pKills ?? p.Killed ?? 0);
       }
       if (category === 'hours') {
-        return Number(p.ConnectTime ?? p.pConnectTime ?? p.Hours ?? 0);
+        return Number(p.ConnectTime ?? p.pConnectTime ?? p.Hours ?? p.pHours ?? 0);
       }
       if (category === 'arrests') {
         return Number(p.Arrests ?? p.Arrested ?? p.pArrests ?? 0);
